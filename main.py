@@ -1,10 +1,12 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord.ui import View, Button, Select
 import json
 import os
-from datetime import datetime
+import io
+from datetime import datetime, time, timezone, timedelta
 import calendar
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,24 +18,56 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-DATA_FILE = 'data/leaves.json'
+DATA_FILE = 'data/leaves.json'          # 現用：今天與未來
+ARCHIVE_FILE = 'data/leaves_archive.json'  # 封存：過去的歷史紀錄
+CONFIG_FILE = 'data/config.json'        # 設定（例如面板所在頻道）
+
+TW_TZ = timezone(timedelta(hours=8))    # 台灣時區 UTC+8
 
 def ensure_data_file():
     if not os.path.exists('data'):
         os.makedirs('data')
-    if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump({}, f, ensure_ascii=False, indent=2)
+    for path in (DATA_FILE, ARCHIVE_FILE):
+        if not os.path.exists(path):
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
 
-def load_leaves():
+def _load(path):
     ensure_data_file()
-    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def save_leaves(data):
+def _save(path, data):
     ensure_data_file()
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_leaves():
+    """現用資料（今天與未來），請假申請與重複檢查都以此為準"""
+    return _load(DATA_FILE)
+
+def save_leaves(data):
+    _save(DATA_FILE, data)
+
+def load_archive():
+    return _load(ARCHIVE_FILE)
+
+def get_all_leaves():
+    """現用 + 封存 合併，供月曆顯示歷史用（兩者日期不重疊）"""
+    merged = load_archive()
+    merged.update(load_leaves())
+    return merged
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def save_config(cfg):
+    ensure_data_file()
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 def add_leave(user_id, username, date_str):
     leaves = load_leaves()
@@ -46,6 +80,115 @@ def add_leave(user_id, username, date_str):
     leaves[date_str].append({'user_id': user_id, 'username': username})
     save_leaves(leaves)
     return True
+
+def remove_leave(user_id, date_str):
+    """取消使用者在某天的請假（只動現用資料、且只能取消今天起的），回傳是否成功"""
+    if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
+        return False  # 不允許取消過去的請假
+    leaves = load_leaves()
+    if date_str not in leaves:
+        return False
+    new_list = [e for e in leaves[date_str] if e['user_id'] != user_id]
+    if len(new_list) == len(leaves[date_str]):
+        return False
+    if new_list:
+        leaves[date_str] = new_list
+    else:
+        del leaves[date_str]
+    save_leaves(leaves)
+    return True
+
+def get_user_leaves(user_id):
+    """回傳使用者今天起（含今天）的請假日期（已排序）"""
+    leaves = load_leaves()
+    today = datetime.now().date()
+    return sorted(
+        d for d in leaves
+        if datetime.strptime(d, "%Y-%m-%d").date() >= today
+        and any(e['user_id'] == user_id for e in leaves[d])
+    )
+
+def archive_past_leaves():
+    """將已過去的請假（當天不搬，隔天才搬）從現用搬到封存檔，回傳搬移的天數"""
+    leaves = load_leaves()
+    today = datetime.now().date()
+    past = [
+        d for d in leaves
+        if datetime.strptime(d, "%Y-%m-%d").date() < today
+    ]
+    if not past:
+        return 0
+    archive = load_archive()
+    for d in past:
+        archive[d] = leaves.pop(d)
+    save_leaves(leaves)
+    _save(ARCHIVE_FILE, archive)
+    return len(past)
+
+FONT_PATH = "C:/Windows/Fonts/msjh.ttc"
+
+def generate_calendar_image(year, month):
+    """產生當月月曆圖，每格顯示當天請假人數（不寫名字），回傳 BytesIO"""
+    leaves = get_all_leaves()
+
+    cell_w, cell_h = 130, 90
+    header_h = 70
+    weekday_h = 44
+    cols = 7
+
+    cal = calendar.Calendar(firstweekday=6)  # 週日為一週的開始
+    weeks = cal.monthdayscalendar(year, month)
+    rows = len(weeks)
+
+    width = cell_w * cols
+    height = header_h + weekday_h + cell_h * rows
+
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+
+    title_font = ImageFont.truetype(FONT_PATH, 34)
+    wd_font = ImageFont.truetype(FONT_PATH, 22)
+    day_font = ImageFont.truetype(FONT_PATH, 24)
+    cnt_font = ImageFont.truetype(FONT_PATH, 22)
+
+    # 標題
+    draw.text((width / 2, header_h / 2), f"{year} 年 {month} 月",
+              font=title_font, fill="black", anchor="mm")
+
+    # 星期列
+    weekdays = ["日", "一", "二", "三", "四", "五", "六"]
+    for i, wd in enumerate(weekdays):
+        x = i * cell_w + cell_w / 2
+        y = header_h + weekday_h / 2
+        draw.text((x, y), wd, font=wd_font,
+                  fill="#d9534f" if i in (0, 6) else "black", anchor="mm")
+
+    today = datetime.now().date()
+    for r, week in enumerate(weeks):
+        for c, day in enumerate(week):
+            x0 = c * cell_w
+            y0 = header_h + weekday_h + r * cell_h
+            x1, y1 = x0 + cell_w, y0 + cell_h
+
+            if day != 0 and datetime(year, month, day).date() == today:
+                draw.rectangle([x0, y0, x1, y1], fill="#fff3cd")
+            draw.rectangle([x0, y0, x1, y1], outline="#cccccc", width=1)
+
+            if day == 0:
+                continue
+
+            date_str = f"{year}-{month:02d}-{day:02d}"
+            count = len(leaves.get(date_str, []))
+
+            draw.text((x0 + 8, y0 + 6), str(day), font=day_font, fill="black")
+            draw.text((x0 + cell_w / 2, y0 + cell_h * 0.62), f"{count}人",
+                      font=cnt_font, fill="#d9534f" if count > 0 else "#aaaaaa",
+                      anchor="mm")
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return buf
 
 
 class CalendarView(View):
@@ -184,16 +327,157 @@ class CalendarView(View):
             await interaction.response.send_message("❌ 不能申請過去的日期", ephemeral=True)
             return
         success = add_leave(interaction.user.id, interaction.user.name, date_str)
-        if success:
-            await interaction.response.send_message(
-                f"✅ 已記錄請假日期：{date_str}\n使用者：{interaction.user.name}",
-                ephemeral=True
-            )
-        else:
+        if not success:
             await interaction.response.send_message(
                 f"⚠️ 你已經申請過 {date_str} 的請假了",
                 ephemeral=True
             )
+            return
+
+        await interaction.response.send_message(
+            f"✅ 已記錄請假日期：{date_str}\n使用者：{interaction.user.name}",
+            ephemeral=True
+        )
+
+        # 當天臨時請假 → 發出公開提醒讓大家注意
+        if datetime.strptime(date_str, "%Y-%m-%d").date() == datetime.now().date():
+            embed = discord.Embed(
+                title="⚠️ 有人臨時請假喔",
+                description=f"**{interaction.user.name}** 申請了今天（{date_str}）的請假，請大家注意！",
+                color=discord.Color.red()
+            )
+            await interaction.channel.send(embed=embed)
+
+
+class LeaveCalendarView(View):
+    """請假月曆檢視 - 顯示當月人數圖，可換月並查詢某天誰請假"""
+    def __init__(self, year: int, month: int):
+        super().__init__(timeout=300)
+        self.year = year
+        self.month = month
+        self.build_day_select()
+
+    def shift_month(self, delta: int):
+        m = self.month + delta
+        y = self.year
+        if m < 1:
+            m, y = 12, y - 1
+        elif m > 12:
+            m, y = 1, y + 1
+        self.year, self.month = y, m
+
+    def build_day_select(self):
+        """重建「查看某天誰請假」的下拉選單，只列出當月有人請假的日期"""
+        for item in list(self.children):
+            if isinstance(item, Select):
+                self.remove_item(item)
+
+        leaves = get_all_leaves()
+        options = []
+        max_day = calendar.monthrange(self.year, self.month)[1]
+        for day in range(1, max_day + 1):
+            date_str = f"{self.year}-{self.month:02d}-{day:02d}"
+            cnt = len(leaves.get(date_str, []))
+            if cnt > 0:
+                options.append(discord.SelectOption(
+                    label=f"{self.month}月{day}日（{cnt}人）",
+                    value=date_str
+                ))
+
+        if options:
+            sel = Select(placeholder="選擇日期查看誰請假...", options=options[:25], row=1)
+            sel.callback = self.day_selected
+            self.add_item(sel)
+
+    def make_embed_and_file(self):
+        buf = generate_calendar_image(self.year, self.month)
+        file = discord.File(buf, filename="calendar.png")
+        embed = discord.Embed(title="📋 請假月曆", color=discord.Color.orange())
+        embed.set_image(url="attachment://calendar.png")
+        embed.set_footer(text="格子數字為當天請假人數；下方選單可查看是誰")
+        return embed, file
+
+    async def refresh(self, interaction: discord.Interaction):
+        self.build_day_select()
+        embed, file = self.make_embed_and_file()
+        await interaction.response.edit_message(embed=embed, attachments=[file], view=self)
+
+    @discord.ui.button(label="上月", style=discord.ButtonStyle.secondary, emoji="◀", row=0)
+    async def prev_month(self, interaction: discord.Interaction, button: Button):
+        self.shift_month(-1)
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="下月", style=discord.ButtonStyle.secondary, emoji="▶", row=0)
+    async def next_month(self, interaction: discord.Interaction, button: Button):
+        self.shift_month(1)
+        await self.refresh(interaction)
+
+    async def day_selected(self, interaction: discord.Interaction):
+        date_str = interaction.data['values'][0]
+        leaves = get_all_leaves()
+        names = [u['username'] for u in leaves.get(date_str, [])]
+        if names:
+            desc = "\n".join(f"• {n}" for n in names)
+            embed = discord.Embed(
+                title=f"📅 {date_str} 的請假名單（{len(names)}人）",
+                description=desc,
+                color=discord.Color.blue()
+            )
+        else:
+            embed = discord.Embed(
+                title=f"📅 {date_str}",
+                description="這天目前沒有人請假",
+                color=discord.Color.blue()
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CancelLeaveView(View):
+    """取消請假檢視 - 只列出使用者自己的請假，選一個就取消"""
+    def __init__(self, user_id: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.build_select()
+
+    def build_select(self):
+        for item in list(self.children):
+            if isinstance(item, Select):
+                self.remove_item(item)
+        dates = get_user_leaves(self.user_id)
+        options = [discord.SelectOption(label=d, value=d) for d in dates[:25]]
+        if options:
+            sel = Select(placeholder="選擇要取消的請假日期...", options=options)
+            sel.callback = self.cancel_selected
+            self.add_item(sel)
+
+    async def cancel_selected(self, interaction: discord.Interaction):
+        date_str = interaction.data['values'][0]
+        ok = remove_leave(self.user_id, date_str)
+        self.build_select()
+        remaining = get_user_leaves(self.user_id)
+        if ok:
+            content = f"✅ 已取消 {date_str} 的請假"
+        else:
+            content = "⚠️ 找不到該請假紀錄（可能已被取消）"
+        if not remaining:
+            content += "\n你目前已沒有其他請假。"
+        await interaction.response.edit_message(content=content, view=self)
+
+        # 取消的是「今天」的請假 → 發出公開提醒
+        if ok and datetime.strptime(date_str, "%Y-%m-%d").date() == datetime.now().date():
+            n = len(load_leaves().get(date_str, []))
+            if n > 0:
+                tail = f"還有 {n} 人於今日請假"
+                color = discord.Color.gold()
+            else:
+                tail = "今天無人請假"
+                color = discord.Color.green()
+            embed = discord.Embed(
+                title="📢 有人取消請假",
+                description=f"**{interaction.user.name}** 取消了今天（{date_str}）的請假，{tail}",
+                color=color
+            )
+            await interaction.channel.send(embed=embed)
 
 
 class PersistentPanelView(View):
@@ -213,29 +497,50 @@ class PersistentPanelView(View):
 
     @discord.ui.button(label="查看請假", style=discord.ButtonStyle.secondary, custom_id="panel_view", emoji="📋")
     async def view_button(self, interaction: discord.Interaction, button: Button):
-        leaves = load_leaves()
-        if not leaves:
-            await interaction.response.send_message("📭 暫無請假記錄", ephemeral=True)
-            return
+        now = datetime.now()
+        view = LeaveCalendarView(now.year, now.month)
+        embed, file = view.make_embed_and_file()
+        await interaction.response.send_message(embed=embed, view=view, file=file, ephemeral=True)
 
-        embed = discord.Embed(
-            title="📋 請假記錄",
-            description="所有請假申請",
-            color=discord.Color.orange()
+    @discord.ui.button(label="取消請假", style=discord.ButtonStyle.danger, custom_id="panel_cancel", emoji="✖️")
+    async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        dates = get_user_leaves(interaction.user.id)
+        if not dates:
+            await interaction.response.send_message("📭 你目前沒有可取消的請假", ephemeral=True)
+            return
+        view = CancelLeaveView(interaction.user.id)
+        await interaction.response.send_message(
+            "請選擇要取消的請假日期：", view=view, ephemeral=True
         )
-        for date_str in sorted(leaves.keys()):
-            user_names = ', '.join([u['username'] for u in leaves[date_str]])
-            embed.add_field(name=date_str, value=user_names, inline=False)
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="清空請假", style=discord.ButtonStyle.danger, custom_id="panel_clear", emoji="🗑️")
-    async def clear_button(self, interaction: discord.Interaction, button: Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ 只有管理員才能清空請假記錄", ephemeral=True)
-            return
-        save_leaves({})
-        await interaction.response.send_message("✅ 已清空所有請假記錄", ephemeral=True)
+@tasks.loop(time=time(hour=0, minute=5, tzinfo=TW_TZ))
+async def daily_archive():
+    """每天（台灣時間）凌晨 00:05 把過去的請假搬到封存檔"""
+    count = archive_past_leaves()
+    if count:
+        print(f"🗄️ 已封存 {count} 天過期的請假資料")
+
+
+@tasks.loop(time=time(hour=9, minute=0, tzinfo=TW_TZ))
+async def daily_reminder():
+    """每天（台灣時間）早上 9:00 提醒今天有人請假（沒有則跳過）"""
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    today_list = load_leaves().get(today, [])
+    if not today_list:
+        return
+    ch_id = load_config().get('panel_channel_id')
+    channel = bot.get_channel(ch_id) if ch_id else None
+    if channel is None:
+        print("⚠️ 找不到面板頻道，無法發送今日請假提醒（請先執行 !設置面板）")
+        return
+    names = '、'.join(u['username'] for u in today_list)
+    embed = discord.Embed(
+        title="📢 今日請假提醒",
+        description=f"今天（{today}）請假的有：\n{names}",
+        color=discord.Color.red()
+    )
+    await channel.send(embed=embed)
 
 
 @bot.event
@@ -244,20 +549,38 @@ async def on_ready():
     ensure_data_file()
     bot.add_view(PersistentPanelView())
     print("✅ 持久面板已註冊")
+    # 啟動時先封存一次，之後每天定時封存
+    archive_past_leaves()
+    if not daily_archive.is_running():
+        daily_archive.start()
+    if not daily_reminder.is_running():
+        daily_reminder.start()
+    print("✅ 每日封存與提醒任務已啟動")
 
 
 @bot.command(name='設置面板')
 @commands.has_permissions(administrator=True)
 async def setup_panel(ctx):
-    """在當前頻道發送持久請假面板（管理員）"""
+    """在當前頻道發送持久請假面板（管理員），並記住此頻道供每日提醒使用"""
+    cfg = load_config()
+    cfg['panel_channel_id'] = ctx.channel.id
+    save_config(cfg)
+
     embed = discord.Embed(
         title="🏢 請假系統",
-        description="使用下方按鈕申請請假、查看記錄或清空資料",
+        description="使用下方按鈕申請請假、查看記錄或取消自己的請假",
         color=discord.Color.green()
     )
-    embed.set_footer(text="清空功能僅管理員可用")
+    embed.set_footer(text="每日請假提醒會發送到此頻道")
     await ctx.send(embed=embed, view=PersistentPanelView())
-    await ctx.message.delete()
+
+
+@bot.command(name='清空請假')
+@commands.has_permissions(administrator=True)
+async def clear_leaves(ctx):
+    """清空目前（今天與未來）的請假記錄，歷史封存保留（僅管理員）"""
+    save_leaves({})
+    await ctx.send("✅ 已清空目前（今天與未來）的請假記錄\n（過去的歷史封存仍保留）")
 
 
 # 運行bot

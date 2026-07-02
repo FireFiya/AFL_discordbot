@@ -4,12 +4,49 @@ from discord.ui import View, Button, Select
 import json
 import os
 import io
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, time, timezone, timedelta
 import calendar
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def setup_logging():
+    """設定日誌：同時輸出到終端機與 logs/bot.log（自動輪替）"""
+    # 讓 Windows 終端機也能正常顯示中文（StreamHandler 預設寫到 stderr）
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8')
+        except (AttributeError, ValueError):
+            pass
+    os.makedirs('logs', exist_ok=True)
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if root.handlers:  # 避免重複載入時加到重複的 handler
+        return logging.getLogger('leavebot')
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    file_handler = RotatingFileHandler(
+        'logs/bot.log', maxBytes=1_000_000, backupCount=5, encoding='utf-8'
+    )
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+    return logging.getLogger('leavebot')
+
+
+log = setup_logging()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -338,6 +375,7 @@ class CalendarView(View):
             f"✅ 已記錄請假日期：{date_str}\n使用者：{interaction.user.name}",
             ephemeral=True
         )
+        log.info(f"請假申請：{interaction.user}（{interaction.user.id}）→ {date_str}")
 
         # 當天臨時請假 → 發出公開提醒讓大家注意
         if datetime.strptime(date_str, "%Y-%m-%d").date() == datetime.now().date():
@@ -456,6 +494,7 @@ class CancelLeaveView(View):
         self.build_select()
         remaining = get_user_leaves(self.user_id)
         if ok:
+            log.info(f"取消請假：{interaction.user}（{interaction.user.id}）→ {date_str}")
             content = f"✅ 已取消 {date_str} 的請假"
         else:
             content = "⚠️ 找不到該請假紀錄（可能已被取消）"
@@ -519,7 +558,7 @@ async def daily_archive():
     """每天（台灣時間）凌晨 00:05 把過去的請假搬到封存檔"""
     count = archive_past_leaves()
     if count:
-        print(f"🗄️ 已封存 {count} 天過期的請假資料")
+        log.info(f"已封存 {count} 天過期的請假資料")
 
 
 @tasks.loop(time=time(hour=9, minute=0, tzinfo=TW_TZ))
@@ -532,7 +571,7 @@ async def daily_reminder():
     ch_id = load_config().get('panel_channel_id')
     channel = bot.get_channel(ch_id) if ch_id else None
     if channel is None:
-        print("⚠️ 找不到面板頻道，無法發送今日請假提醒（請先執行 !設置面板）")
+        log.warning("找不到面板頻道，無法發送今日請假提醒（請先執行 !設置面板）")
         return
     names = '、'.join(u['username'] for u in today_list)
     embed = discord.Embed(
@@ -541,21 +580,22 @@ async def daily_reminder():
         color=discord.Color.red()
     )
     await channel.send(embed=embed)
+    log.info(f"已發送今日請假提醒（{today}，{len(today_list)} 人）")
 
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} 已連接到Discord')
+    log.info(f'{bot.user} 已連接到 Discord')
     ensure_data_file()
     bot.add_view(PersistentPanelView())
-    print("✅ 持久面板已註冊")
+    log.info("持久面板已註冊")
     # 啟動時先封存一次，之後每天定時封存
     archive_past_leaves()
     if not daily_archive.is_running():
         daily_archive.start()
     if not daily_reminder.is_running():
         daily_reminder.start()
-    print("✅ 每日封存與提醒任務已啟動")
+    log.info("每日封存與提醒任務已啟動")
 
 
 @bot.command(name='設置面板')
@@ -573,6 +613,7 @@ async def setup_panel(ctx):
     )
     embed.set_footer(text="每日請假提醒會發送到此頻道")
     await ctx.send(embed=embed, view=PersistentPanelView())
+    log.info(f"面板已設置：{ctx.author} 於頻道 {ctx.channel}（{ctx.channel.id}）")
 
 
 @bot.command(name='清空請假')
@@ -580,6 +621,7 @@ async def setup_panel(ctx):
 async def clear_leaves(ctx):
     """清空目前（今天與未來）的請假記錄，歷史封存保留（僅管理員）"""
     save_leaves({})
+    log.info(f"清空請假：{ctx.author}（{ctx.author.id}）清空了現用請假記錄")
     await ctx.send("✅ 已清空目前（今天與未來）的請假記錄\n（過去的歷史封存仍保留）")
 
 
@@ -587,8 +629,8 @@ async def clear_leaves(ctx):
 if __name__ == '__main__':
     token = os.getenv('DISCORD_TOKEN')
     if not token:
-        print("❌ 錯誤：未找到有效的 DISCORD_TOKEN")
-        print("請確保 .env 檔案中有 DISCORD_TOKEN=你的token")
+        log.error("未找到有效的 DISCORD_TOKEN，請確保 .env 檔案中有 DISCORD_TOKEN=你的token")
         exit(1)
-    print(f"✅ Token 已載入，長度: {len(token)}")
-    bot.run(token)
+    log.info(f"Token 已載入，長度: {len(token)}")
+    # log_handler=None：不讓 discord.py 另外加 handler，統一由我們的設定輸出
+    bot.run(token, log_handler=None)

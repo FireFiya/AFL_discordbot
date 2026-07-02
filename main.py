@@ -162,7 +162,31 @@ def archive_past_leaves():
     _save(ARCHIVE_FILE, archive)
     return len(past)
 
-FONT_PATH = "C:/Windows/Fonts/msjh.ttc"
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
+
+def _resolve_font_path():
+    """自動尋找可用的中文字型，跨平台（部署到 Linux 也能運作）"""
+    # 1) 專案 fonts/ 內附帶的任何字型檔（隨專案一起部署最方便）
+    if os.path.isdir(FONTS_DIR):
+        for name in sorted(os.listdir(FONTS_DIR)):
+            if name.lower().endswith(('.ttc', '.otf', '.ttf')):
+                return os.path.join(FONTS_DIR, name)
+    # 2) 常見系統字型位置（Linux 的 Noto、Windows 的微軟正黑體）
+    for path in (
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc',
+        'C:/Windows/Fonts/msjh.ttc',
+    ):
+        if os.path.exists(path):
+            return path
+    return None
+
+FONT_PATH = _resolve_font_path()
+if FONT_PATH is None:
+    log.warning("找不到中文字型，月曆圖將無法產生；請放一份字型檔到 fonts/ 資料夾")
+else:
+    log.info(f"使用字型：{FONT_PATH}")
 
 def generate_calendar_image(year, month):
     """產生當月月曆圖，每格顯示當天請假人數（不寫名字），回傳 BytesIO"""

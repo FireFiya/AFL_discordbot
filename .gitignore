@@ -5,6 +5,9 @@
 # 執行資料（含使用者名稱、ID、頻道等，勿提交）
 data/*.json
 
+# 日誌
+logs/
+
 # Python
 __pycache__/
 *.py[cod]

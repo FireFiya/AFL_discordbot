@@ -634,12 +634,26 @@ async def on_command_error(ctx, error):
 
 
 @bot.command(name='設置面板')
-@commands.has_permissions(manage_guild=True)
 async def setup_panel(ctx):
-    """在當前頻道發送持久請假面板（需管理伺服器權限），並記住此頻道供每日提醒使用"""
+    """發送請假面板：管理員可指定頻道；一般人只能在管理員指定的頻道張貼"""
+    is_admin = ctx.guild is not None and ctx.author.guild_permissions.manage_guild
     cfg = load_config()
-    cfg['panel_channel_id'] = ctx.channel.id
-    save_config(cfg)
+    designated = cfg.get('panel_channel_id')
+
+    if is_admin:
+        # 管理員「起個頭 / 更改頻道」：把當前頻道設為指定頻道
+        cfg['panel_channel_id'] = ctx.channel.id
+        save_config(cfg)
+        log.info(f"面板已設置＋指定頻道更新：{ctx.author} 於頻道 {ctx.channel}（{ctx.channel.id}）")
+    else:
+        # 一般人只能在管理員指定的頻道張貼面板
+        if designated is None:
+            await ctx.send("⚠️ 尚未由管理員指定面板頻道，請先請管理員執行 !設置面板", delete_after=10)
+            return
+        if ctx.channel.id != designated:
+            await ctx.send("❌ 只能在管理員指定的頻道設置面板", delete_after=10)
+            return
+        log.info(f"面板已張貼（指定頻道）：{ctx.author} 於頻道 {ctx.channel}（{ctx.channel.id}）")
 
     embed = discord.Embed(
         title="🏢 請假系統",
@@ -648,7 +662,6 @@ async def setup_panel(ctx):
     )
     embed.set_footer(text="每日請假提醒會發送到此頻道")
     await ctx.send(embed=embed, view=PersistentPanelView())
-    log.info(f"面板已設置：{ctx.author} 於頻道 {ctx.channel}（{ctx.channel.id}）")
 
 
 @bot.command(name='清空請假')

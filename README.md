@@ -102,7 +102,17 @@ AFL_discordbot/
 - [Pillow](https://python-pillow.org/) — 產生月曆圖片
 - python-dotenv — 讀取 `.env`
 
-> 月曆圖片使用微軟正黑體（`C:/Windows/Fonts/msjh.ttc`）。若部署到非 Windows 環境，需在 `main.py` 的 `FONT_PATH` 改為該系統上的中文字型路徑。
+### 中文字型
+
+月曆圖片需要中文字型。專案已內附 **Noto Sans CJK TC**（開源 OFL 授權，可自由散布）於 `fonts/` 資料夾，程式會**自動偵測**字型，順序為：
+
+1. 專案 `fonts/` 內的任何 `.ttc` / `.otf` / `.ttf`（隨專案一起部署，跨平台最方便）
+2. 常見 Linux 系統字型（`/usr/share/fonts/.../NotoSansCJK-Regular.ttc`）
+3. Windows 微軟正黑體（`C:/Windows/Fonts/msjh.ttc`）
+
+因此**部署到 Google Cloud 等 Linux 環境時，整包帶著 `fonts/` 即可，不需額外設定**。若想換字型，把字型檔放進 `fonts/` 即可自動採用。
+
+> 註：微軟正黑體為專有字型，請勿放入公開 repo 散布；`fonts/` 內附的 Noto 字型才可自由散布。
 
 ## 授權
 

@@ -622,10 +622,21 @@ async def on_ready():
     log.info("每日封存與提醒任務已啟動")
 
 
+@bot.event
+async def on_command_error(ctx, error):
+    """統一的指令錯誤處理"""
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ 你需要「管理伺服器」權限才能使用此指令", delete_after=10)
+    elif isinstance(error, commands.CommandNotFound):
+        pass  # 打錯指令名就安靜忽略，不洗 log
+    else:
+        log.error(f"指令錯誤（{ctx.command}）：{error}")
+
+
 @bot.command(name='設置面板')
-@commands.has_permissions(administrator=True)
+@commands.has_permissions(manage_guild=True)
 async def setup_panel(ctx):
-    """在當前頻道發送持久請假面板（管理員），並記住此頻道供每日提醒使用"""
+    """在當前頻道發送持久請假面板（需管理伺服器權限），並記住此頻道供每日提醒使用"""
     cfg = load_config()
     cfg['panel_channel_id'] = ctx.channel.id
     save_config(cfg)
@@ -641,9 +652,9 @@ async def setup_panel(ctx):
 
 
 @bot.command(name='清空請假')
-@commands.has_permissions(administrator=True)
+@commands.has_permissions(manage_guild=True)
 async def clear_leaves(ctx):
-    """清空目前（今天與未來）的請假記錄，歷史封存保留（僅管理員）"""
+    """清空目前（今天與未來）的請假記錄，歷史封存保留（需管理伺服器權限）"""
     save_leaves({})
     log.info(f"清空請假：{ctx.author}（{ctx.author.id}）清空了現用請假記錄")
     await ctx.send("✅ 已清空目前（今天與未來）的請假記錄\n（過去的歷史封存仍保留）")

@@ -424,7 +424,6 @@ class CalendarView(View):
 
         recurring = Button(
             label="定時請假",
-            emoji="🔁",
             style=discord.ButtonStyle.primary if self.recurring_mode else discord.ButtonStyle.secondary,
             custom_id=f"recurring_{self.user_id}",
             row=2

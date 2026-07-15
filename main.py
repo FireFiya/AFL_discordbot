@@ -218,6 +218,14 @@ def remove_recurring_leaves(user_id, weekday, year, month):
             count += 1
     return count
 
+def count_user_recurring_leaves(user_id, weekday, year, month):
+    """使用者在某月（今天起）該星期幾實際已請的天數"""
+    leaves = load_leaves()
+    return sum(
+        1 for date_str in _month_days_of_weekday(year, month, weekday)
+        if any(e['user_id'] == user_id for e in leaves.get(date_str, []))
+    )
+
 def generate_all_recurring_for_month(year, month):
     """為所有有定期規則的人產生該月的假，回傳（人數, 總天數）"""
     data = load_recurring()
@@ -424,6 +432,7 @@ class CalendarView(View):
 
         recurring = Button(
             label="定時請假",
+            emoji="🔁",
             style=discord.ButtonStyle.primary if self.recurring_mode else discord.ButtonStyle.secondary,
             custom_id=f"recurring_{self.user_id}",
             row=2
@@ -659,43 +668,46 @@ class LeaveCalendarView(View):
 
 
 class RecurringCancelConfirmView(View):
-    """取消定期請假的確認：可選擇連規則一起停，或只清當月、規則保留"""
+    """停止定期請假的確認：一律停止規則，只問本月已請的假要不要一起刪掉"""
     def __init__(self, user_id: int, weekday: int):
         super().__init__(timeout=120)
         self.user_id = user_id
         self.weekday = weekday
 
-    async def _do_cancel(self, interaction: discord.Interaction, stop_rule: bool):
+    async def _do_cancel(self, interaction: discord.Interaction, delete_leaves: bool):
         if interaction.user.id != self.user_id:
             await interaction.response.defer()
             return
         name = WEEKDAY_NAMES[self.weekday]
         now = datetime.now()
-        removed = remove_recurring_leaves(self.user_id, self.weekday, now.year, now.month)
-        if stop_rule:
-            remove_user_weekday(self.user_id, self.weekday)
-            tail = "已停止定期，下個月不會再自動請假。"
+
+        remove_user_weekday(self.user_id, self.weekday)  # 一律停止定期
+
+        if delete_leaves:
+            removed = remove_recurring_leaves(self.user_id, self.weekday, now.year, now.month)
+            tail = f"本月（{now.month}月）已請的 **{removed}** 天週{name}也一併刪除。"
         else:
-            tail = "定期規則保留，下個月 1 號仍會自動排入。"
+            kept = count_user_recurring_leaves(self.user_id, self.weekday, now.year, now.month)
+            tail = f"本月（{now.month}月）已請的 **{kept}** 天週{name}保留不變。"
 
         log.info(
-            f"取消定期請假：{interaction.user}（{interaction.user.id}）每周{name}，"
-            f"清除 {removed} 天，stop_rule={stop_rule}"
+            f"停止定期請假：{interaction.user}（{interaction.user.id}）每周{name}，"
+            f"delete_leaves={delete_leaves}"
         )
         embed = discord.Embed(
-            title=f"✅ 已清除本月每周{name}的請假",
-            description=f"本月（{now.month}月）清除了 **{removed}** 天。\n{tail}",
+            title=f"✅ 已停止每周{name}的定期請假",
+            description=f"下個月起不會再自動排入。\n{tail}",
             color=discord.Color.green()
         )
         await interaction.response.edit_message(content=None, embed=embed, view=None)
 
-    @discord.ui.button(label="刪除當月假 ＋ 停止定期", style=discord.ButtonStyle.danger, row=0)
-    async def stop_all(self, interaction: discord.Interaction, button: Button):
-        await self._do_cancel(interaction, stop_rule=True)
+    @discord.ui.button(label="停止定期 ＋ 刪除當月假", style=discord.ButtonStyle.danger, row=0)
+    async def stop_and_delete(self, interaction: discord.Interaction, button: Button):
+        await self._do_cancel(interaction, delete_leaves=True)
 
-    @discord.ui.button(label="刪除當月假 ＋ 保留定期", style=discord.ButtonStyle.primary, row=0)
-    async def keep_rule(self, interaction: discord.Interaction, button: Button):
-        await self._do_cancel(interaction, stop_rule=False)
+    @discord.ui.button(label="停止定期 ＋ 保留當月假", style=discord.ButtonStyle.primary, row=0)
+    async def stop_and_keep(self, interaction: discord.Interaction, button: Button):
+        await self._do_cancel(interaction, delete_leaves=False)
 
     @discord.ui.button(label="返回", style=discord.ButtonStyle.secondary, row=1)
     async def go_back(self, interaction: discord.Interaction, button: Button):
@@ -746,14 +758,15 @@ class CancelLeaveView(View):
             weekday = int(value.split(":", 1)[1])
             name = WEEKDAY_NAMES[weekday]
             now = datetime.now()
-            pending = len(_month_days_of_weekday(now.year, now.month, weekday))
+            pending = count_user_recurring_leaves(self.user_id, weekday, now.year, now.month)
             embed = discord.Embed(
-                title=f"🔁 取消定期請假：每周{name}",
+                title=f"🔁 停止定期請假：每周{name}",
                 description=(
-                    f"本月（{now.month}月）今天起還有 **{pending}** 天的週{name}。\n\n"
-                    "要怎麼處理？\n"
-                    "• **停止定期** → 清掉本月剩餘的假，之後不再自動請\n"
-                    "• **保留定期** → 只清本月（當作這個月例外），下個月照常自動請"
+                    f"將停止每周{name}的定期請假，下個月起不再自動排入。\n\n"
+                    f"你本月（{now.month}月）今天起還有 **{pending}** 天已請好的週{name}，"
+                    "要一起刪除嗎？\n\n"
+                    "• **刪除當月假** → 連本月已請的一起清掉\n"
+                    "• **保留當月假** → 本月已請的照常，只是之後不再自動排入"
                 ),
                 color=discord.Color.orange()
             )

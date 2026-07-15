@@ -58,13 +58,19 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 DATA_FILE = 'data/leaves.json'          # 現用：今天與未來
 ARCHIVE_FILE = 'data/leaves_archive.json'  # 封存：過去的歷史紀錄
 CONFIG_FILE = 'data/config.json'        # 設定（例如面板所在頻道）
+RECURRING_FILE = 'data/recurring.json'  # 定期請假規則（每周X）
 
 TW_TZ = timezone(timedelta(hours=8))    # 台灣時區 UTC+8
+
+# Python 的 weekday()：週一=0 … 週日=6
+WEEKDAY_NAMES = ['一', '二', '三', '四', '五', '六', '日']
+# 選單顯示順序：日 → 六
+WEEKDAY_UI_ORDER = [6, 0, 1, 2, 3, 4, 5]
 
 def ensure_data_file():
     if not os.path.exists('data'):
         os.makedirs('data')
-    for path in (DATA_FILE, ARCHIVE_FILE):
+    for path in (DATA_FILE, ARCHIVE_FILE, RECURRING_FILE):
         if not os.path.exists(path):
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({}, f, ensure_ascii=False, indent=2)
@@ -144,6 +150,88 @@ def get_user_leaves(user_id):
         if datetime.strptime(d, "%Y-%m-%d").date() >= today
         and any(e['user_id'] == user_id for e in leaves[d])
     )
+
+# ---------- 定期請假（每周X） ----------
+
+def load_recurring():
+    return _load(RECURRING_FILE)
+
+def save_recurring(data):
+    _save(RECURRING_FILE, data)
+
+def get_user_weekdays(user_id):
+    """回傳使用者已設定的定期星期幾（Python weekday，已排序）"""
+    entry = load_recurring().get(str(user_id))
+    return sorted(entry['weekdays']) if entry else []
+
+def add_user_weekday(user_id, username, weekday):
+    """新增一條定期規則，回傳是否新增成功（已存在則 False）"""
+    data = load_recurring()
+    key = str(user_id)
+    entry = data.setdefault(key, {'username': username, 'weekdays': []})
+    entry['username'] = username  # 名稱可能改過，順便更新
+    if weekday in entry['weekdays']:
+        return False
+    entry['weekdays'].append(weekday)
+    save_recurring(data)
+    return True
+
+def remove_user_weekday(user_id, weekday):
+    """移除一條定期規則，回傳是否移除成功"""
+    data = load_recurring()
+    key = str(user_id)
+    entry = data.get(key)
+    if not entry or weekday not in entry['weekdays']:
+        return False
+    entry['weekdays'].remove(weekday)
+    if not entry['weekdays']:
+        del data[key]
+    save_recurring(data)
+    return True
+
+def _month_days_of_weekday(year, month, weekday, from_today=True):
+    """回傳某月中所有符合星期幾的日期字串；from_today=True 時略過已過去的日子"""
+    today = datetime.now().date()
+    result = []
+    for day in range(1, calendar.monthrange(year, month)[1] + 1):
+        d = datetime(year, month, day).date()
+        if d.weekday() != weekday:
+            continue
+        if from_today and d < today:
+            continue
+        result.append(d.strftime("%Y-%m-%d"))
+    return result
+
+def generate_recurring_leaves(user_id, username, weekday, year, month):
+    """把某月（今天起）符合星期幾的日子請起來，回傳實際新增的天數（重複的會被跳過）"""
+    count = 0
+    for date_str in _month_days_of_weekday(year, month, weekday):
+        if add_leave(user_id, username, date_str):
+            count += 1
+    return count
+
+def remove_recurring_leaves(user_id, weekday, year, month):
+    """刪除某月（今天起）符合星期幾的請假，回傳實際刪除的天數"""
+    count = 0
+    for date_str in _month_days_of_weekday(year, month, weekday):
+        if remove_leave(user_id, date_str):
+            count += 1
+    return count
+
+def generate_all_recurring_for_month(year, month):
+    """為所有有定期規則的人產生該月的假，回傳（人數, 總天數）"""
+    data = load_recurring()
+    users = 0
+    total = 0
+    for key, entry in data.items():
+        added = 0
+        for wd in entry['weekdays']:
+            added += generate_recurring_leaves(int(key), entry['username'], wd, year, month)
+        if added:
+            users += 1
+            total += added
+    return users, total
+
 
 def archive_past_leaves():
     """將已過去的請假（當天不搬，隔天才搬）從現用搬到封存檔，回傳搬移的天數"""
@@ -253,7 +341,7 @@ def generate_calendar_image(year, month):
 
 
 class CalendarView(View):
-    """日曆選擇檢視 - 使用年、月、上/下半月、日期選擇"""
+    """日曆選擇檢視 - 年/月/上下半月/日期選擇，另有「定時請假」模式選星期幾"""
     def __init__(self, user_id: int):
         super().__init__()
         self.user_id = user_id
@@ -261,43 +349,64 @@ class CalendarView(View):
         self.year = now.year
         self.month = now.month
         self.is_second_half = False
+        self.recurring_mode = False  # True 時改為選「每周X」
         self.setup_selects()
 
     def setup_selects(self):
         self.clear_items()
 
-        year_options = [
-            discord.SelectOption(label=str(y), value=str(y), default=(y == self.year))
-            for y in range(self.year, self.year + 25)
-        ]
-        year_select = discord.ui.Select(
-            placeholder="選擇年份...",
-            options=year_options,
-            custom_id=f"year_select_{self.user_id}",
-            row=0
-        )
-        year_select.callback = self.year_changed
-        self.add_item(year_select)
+        if self.recurring_mode:
+            # 定時模式：年、月兩個選單合併成一個「星期幾」選單，日期選單隱藏
+            weekday_options = [
+                discord.SelectOption(
+                    label=f"每周{WEEKDAY_NAMES[wd]}",
+                    value=str(wd),
+                    description=f"本月（{self.month}月）今天起所有週{WEEKDAY_NAMES[wd]}都請假"
+                )
+                for wd in WEEKDAY_UI_ORDER
+            ]
+            weekday_select = discord.ui.Select(
+                placeholder="選擇要定期請假的星期幾...",
+                options=weekday_options,
+                custom_id=f"weekday_select_{self.user_id}",
+                row=0
+            )
+            weekday_select.callback = self.weekday_selected
+            self.add_item(weekday_select)
+        else:
+            year_options = [
+                discord.SelectOption(label=str(y), value=str(y), default=(y == self.year))
+                for y in range(self.year, self.year + 25)
+            ]
+            year_select = discord.ui.Select(
+                placeholder="選擇年份...",
+                options=year_options,
+                custom_id=f"year_select_{self.user_id}",
+                row=0
+            )
+            year_select.callback = self.year_changed
+            self.add_item(year_select)
 
-        month_options = [
-            discord.SelectOption(label=f"{m}月", value=str(m), default=(m == self.month))
-            for m in range(1, 13)
-        ]
-        month_select = discord.ui.Select(
-            placeholder="選擇月份...",
-            options=month_options,
-            custom_id=f"month_select_{self.user_id}",
-            row=1
-        )
-        month_select.callback = self.month_changed
-        self.add_item(month_select)
+            month_options = [
+                discord.SelectOption(label=f"{m}月", value=str(m), default=(m == self.month))
+                for m in range(1, 13)
+            ]
+            month_select = discord.ui.Select(
+                placeholder="選擇月份...",
+                options=month_options,
+                custom_id=f"month_select_{self.user_id}",
+                row=1
+            )
+            month_select.callback = self.month_changed
+            self.add_item(month_select)
 
         max_day = calendar.monthrange(self.year, self.month)[1]
         mid_day = max_day // 2
+        normal = not self.recurring_mode
 
         first_half = Button(
             label=f"上半月 (1-{mid_day}日)",
-            style=discord.ButtonStyle.primary if not self.is_second_half else discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.primary if (normal and not self.is_second_half) else discord.ButtonStyle.secondary,
             custom_id=f"first_half_{self.user_id}",
             row=2
         )
@@ -306,23 +415,34 @@ class CalendarView(View):
 
         second_half = Button(
             label=f"下半月 ({mid_day + 1}-{max_day}日)",
-            style=discord.ButtonStyle.primary if self.is_second_half else discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.primary if (normal and self.is_second_half) else discord.ButtonStyle.secondary,
             custom_id=f"second_half_{self.user_id}",
             row=2
         )
         second_half.callback = self.show_second_half
         self.add_item(second_half)
 
-        date_options = self.get_date_options()
-        if date_options:
-            date_select = discord.ui.Select(
-                placeholder="選擇日期...",
-                options=date_options,
-                custom_id=f"date_select_{self.user_id}",
-                row=3
-            )
-            date_select.callback = self.date_selected
-            self.add_item(date_select)
+        recurring = Button(
+            label="定時請假",
+            emoji="🔁",
+            style=discord.ButtonStyle.primary if self.recurring_mode else discord.ButtonStyle.secondary,
+            custom_id=f"recurring_{self.user_id}",
+            row=2
+        )
+        recurring.callback = self.show_recurring
+        self.add_item(recurring)
+
+        if not self.recurring_mode:
+            date_options = self.get_date_options()
+            if date_options:
+                date_select = discord.ui.Select(
+                    placeholder="選擇日期...",
+                    options=date_options,
+                    custom_id=f"date_select_{self.user_id}",
+                    row=3
+                )
+                date_select.callback = self.date_selected
+                self.add_item(date_select)
 
     def get_date_options(self):
         max_day = calendar.monthrange(self.year, self.month)[1]
@@ -368,6 +488,7 @@ class CalendarView(View):
             await interaction.response.defer()
             return
         self.is_second_half = False
+        self.recurring_mode = False  # 回到一般模式
         self.setup_selects()
         await interaction.response.edit_message(view=self)
 
@@ -376,8 +497,52 @@ class CalendarView(View):
             await interaction.response.defer()
             return
         self.is_second_half = True
+        self.recurring_mode = False  # 回到一般模式
         self.setup_selects()
         await interaction.response.edit_message(view=self)
+
+    async def show_recurring(self, interaction: discord.Interaction):
+        """切換到定時請假模式：只選星期幾，套用當月"""
+        if interaction.user.id != self.user_id:
+            await interaction.response.defer()
+            return
+        now = datetime.now()
+        # 定時請假一律套用「今天所在的月份」
+        self.year, self.month = now.year, now.month
+        self.recurring_mode = True
+        self.setup_selects()
+        await interaction.response.edit_message(view=self)
+
+    async def weekday_selected(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.defer()
+            return
+        weekday = int(interaction.data['values'][0])
+        name = WEEKDAY_NAMES[weekday]
+        now = datetime.now()
+
+        is_new = add_user_weekday(interaction.user.id, interaction.user.name, weekday)
+        added = generate_recurring_leaves(
+            interaction.user.id, interaction.user.name, weekday, now.year, now.month
+        )
+
+        if is_new:
+            title = f"🔁 已設定定期請假：每周{name}"
+        else:
+            title = f"🔁 每周{name} 已在你的定期請假中"
+
+        if added:
+            desc = f"本月（{now.month}月）已為你排入 **{added}** 天的週{name}請假。"
+        else:
+            desc = f"本月（{now.month}月）已無新的週{name}可排入（可能都請過了或已過去）。"
+        desc += "\n\n每月 1 號會自動排入下個月的定期請假。"
+
+        embed = discord.Embed(title=title, description=desc, color=discord.Color.blue())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        log.info(
+            f"定期請假設定：{interaction.user}（{interaction.user.id}）每周{name}，"
+            f"本月排入 {added} 天"
+        )
 
     async def date_selected(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -494,8 +659,58 @@ class LeaveCalendarView(View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class RecurringCancelConfirmView(View):
+    """取消定期請假的確認：可選擇連規則一起停，或只清當月、規則保留"""
+    def __init__(self, user_id: int, weekday: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.weekday = weekday
+
+    async def _do_cancel(self, interaction: discord.Interaction, stop_rule: bool):
+        if interaction.user.id != self.user_id:
+            await interaction.response.defer()
+            return
+        name = WEEKDAY_NAMES[self.weekday]
+        now = datetime.now()
+        removed = remove_recurring_leaves(self.user_id, self.weekday, now.year, now.month)
+        if stop_rule:
+            remove_user_weekday(self.user_id, self.weekday)
+            tail = "已停止定期，下個月不會再自動請假。"
+        else:
+            tail = "定期規則保留，下個月 1 號仍會自動排入。"
+
+        log.info(
+            f"取消定期請假：{interaction.user}（{interaction.user.id}）每周{name}，"
+            f"清除 {removed} 天，stop_rule={stop_rule}"
+        )
+        embed = discord.Embed(
+            title=f"✅ 已清除本月每周{name}的請假",
+            description=f"本月（{now.month}月）清除了 **{removed}** 天。\n{tail}",
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+    @discord.ui.button(label="刪除當月假 ＋ 停止定期", style=discord.ButtonStyle.danger, row=0)
+    async def stop_all(self, interaction: discord.Interaction, button: Button):
+        await self._do_cancel(interaction, stop_rule=True)
+
+    @discord.ui.button(label="刪除當月假 ＋ 保留定期", style=discord.ButtonStyle.secondary, row=0)
+    async def keep_rule(self, interaction: discord.Interaction, button: Button):
+        await self._do_cancel(interaction, stop_rule=False)
+
+    @discord.ui.button(label="返回", style=discord.ButtonStyle.secondary, row=1)
+    async def go_back(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.defer()
+            return
+        view = CancelLeaveView(self.user_id)
+        await interaction.response.edit_message(
+            content="請選擇要取消的請假：", embed=None, view=view
+        )
+
+
 class CancelLeaveView(View):
-    """取消請假檢視 - 只列出使用者自己的請假，選一個就取消"""
+    """取消請假檢視 - 定期請假（每周X）置頂，其餘為一般日期"""
     def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
@@ -505,15 +720,52 @@ class CancelLeaveView(View):
         for item in list(self.children):
             if isinstance(item, Select):
                 self.remove_item(item)
-        dates = get_user_leaves(self.user_id)
-        options = [discord.SelectOption(label=d, value=d) for d in dates[:25]]
+
+        options = []
+        # 定期請假置頂，優先級最高
+        for wd in get_user_weekdays(self.user_id):
+            options.append(discord.SelectOption(
+                label=f"每周{WEEKDAY_NAMES[wd]}（定期請假）",
+                value=f"recurring:{wd}",
+                emoji="🔁",
+                description="取消本月的每周定期請假"
+            ))
+        # 其餘名額給一般日期（選單上限 25）
+        for d in get_user_leaves(self.user_id)[:25 - len(options)]:
+            options.append(discord.SelectOption(label=d, value=f"date:{d}"))
+
         if options:
-            sel = Select(placeholder="選擇要取消的請假日期...", options=options)
+            sel = Select(placeholder="選擇要取消的請假...", options=options)
             sel.callback = self.cancel_selected
             self.add_item(sel)
 
     async def cancel_selected(self, interaction: discord.Interaction):
-        date_str = interaction.data['values'][0]
+        value = interaction.data['values'][0]
+
+        # 定期請假 → 先跳確認
+        if value.startswith("recurring:"):
+            weekday = int(value.split(":", 1)[1])
+            name = WEEKDAY_NAMES[weekday]
+            now = datetime.now()
+            pending = len(_month_days_of_weekday(now.year, now.month, weekday))
+            embed = discord.Embed(
+                title=f"🔁 取消定期請假：每周{name}",
+                description=(
+                    f"本月（{now.month}月）今天起還有 **{pending}** 天的週{name}。\n\n"
+                    "要怎麼處理？\n"
+                    "• **停止定期** → 清掉本月剩餘的假，之後不再自動請\n"
+                    "• **保留定期** → 只清本月（當作這個月例外），下個月照常自動請"
+                ),
+                color=discord.Color.orange()
+            )
+            await interaction.response.edit_message(
+                content=None, embed=embed,
+                view=RecurringCancelConfirmView(self.user_id, weekday)
+            )
+            return
+
+        # 一般日期
+        date_str = value.split(":", 1)[1]
         ok = remove_leave(self.user_id, date_str)
         self.build_select()
         remaining = get_user_leaves(self.user_id)
@@ -568,12 +820,13 @@ class PersistentPanelView(View):
     @discord.ui.button(label="取消請假", style=discord.ButtonStyle.danger, custom_id="panel_cancel", emoji="✖️")
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
         dates = get_user_leaves(interaction.user.id)
-        if not dates:
+        weekdays = get_user_weekdays(interaction.user.id)
+        if not dates and not weekdays:
             await interaction.response.send_message("📭 你目前沒有可取消的請假", ephemeral=True)
             return
         view = CancelLeaveView(interaction.user.id)
         await interaction.response.send_message(
-            "請選擇要取消的請假日期：", view=view, ephemeral=True
+            "請選擇要取消的請假：", view=view, ephemeral=True
         )
 
 
@@ -585,15 +838,25 @@ async def daily_archive():
         log.info(f"已封存 {count} 天過期的請假資料")
 
 
+def _get_panel_channel():
+    ch_id = load_config().get('panel_channel_id')
+    return bot.get_channel(ch_id) if ch_id else None
+
+
 @tasks.loop(time=time(hour=9, minute=0, tzinfo=TW_TZ))
 async def daily_reminder():
-    """每天（台灣時間）早上 9:00 提醒今天有人請假（沒有則跳過）"""
-    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    """每天（台灣時間）早上 9:00：1 號先產生定期假，再提醒今天誰請假"""
+    now = datetime.now(TW_TZ)
+    today = now.strftime("%Y-%m-%d")
+
+    # 每月 1 號：先產生本月定期假（順序很重要，這樣 1 號剛好是定期日時也會被提醒到）
+    if now.day == 1:
+        await _generate_monthly_recurring(now.year, now.month)
+
     today_list = load_leaves().get(today, [])
     if not today_list:
         return
-    ch_id = load_config().get('panel_channel_id')
-    channel = bot.get_channel(ch_id) if ch_id else None
+    channel = _get_panel_channel()
     if channel is None:
         log.warning("找不到面板頻道，無法發送今日請假提醒（請先執行 !設置面板）")
         return
@@ -605,6 +868,28 @@ async def daily_reminder():
     )
     await channel.send(embed=embed)
     log.info(f"已發送今日請假提醒（{today}，{len(today_list)} 人）")
+
+
+async def _generate_monthly_recurring(year, month):
+    """為所有人產生該月定期假，並在頻道發一則總結（不 @ 任何人）"""
+    users, total = generate_all_recurring_for_month(year, month)
+    if not total:
+        return
+    log.info(f"每月定期請假已產生：{year}-{month:02d}，{users} 人共 {total} 天")
+
+    channel = _get_panel_channel()
+    if channel is None:
+        log.warning("找不到面板頻道，無法發送定期請假總結")
+        return
+    embed = discord.Embed(
+        title="📅 本月定期請假已設定完成",
+        description=(
+            f"已為 **{users}** 位成員排入本月（{month}月）的定期請假，共 **{total}** 天。\n"
+            "可點擊面板的「查看請假」查看月曆。"
+        ),
+        color=discord.Color.blue()
+    )
+    await channel.send(embed=embed)
 
 
 @bot.event

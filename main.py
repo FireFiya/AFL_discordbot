@@ -693,7 +693,7 @@ class RecurringCancelConfirmView(View):
     async def stop_all(self, interaction: discord.Interaction, button: Button):
         await self._do_cancel(interaction, stop_rule=True)
 
-    @discord.ui.button(label="刪除當月假 ＋ 保留定期", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="刪除當月假 ＋ 保留定期", style=discord.ButtonStyle.primary, row=0)
     async def keep_rule(self, interaction: discord.Interaction, button: Button):
         await self._do_cancel(interaction, stop_rule=False)
 

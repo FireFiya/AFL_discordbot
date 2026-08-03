@@ -865,19 +865,27 @@ async def daily_reminder():
     if now.day == 1:
         await _generate_monthly_recurring(now.year, now.month)
 
-    today_list = load_leaves().get(today, [])
-    if not today_list:
-        return
     channel = _get_panel_channel()
     if channel is None:
         log.warning("找不到面板頻道，無法發送今日請假提醒（請先執行 !設置面板）")
         return
-    names = '、'.join(u['username'] for u in today_list)
-    embed = discord.Embed(
-        title="📢 今日請假提醒",
-        description=f"今天（{today}）請假的有：\n{names}",
-        color=discord.Color.red()
-    )
+
+    today_list = load_leaves().get(today, [])
+    if today_list:
+        # 有人請假 → 紅色
+        names = '、'.join(u['username'] for u in today_list)
+        embed = discord.Embed(
+            title="📢 今日請假提醒",
+            description=f"今天（{today}）請假的有：\n{names}",
+            color=discord.Color.red()
+        )
+    else:
+        # 無人請假 → 綠色，代表今天有團練
+        embed = discord.Embed(
+            title="📢 今日請假提醒",
+            description=f"今天（{today}）無人請假，有團練 🎶",
+            color=discord.Color.green()
+        )
     await channel.send(embed=embed)
     log.info(f"已發送今日請假提醒（{today}，{len(today_list)} 人）")
 

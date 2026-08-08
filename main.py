@@ -1103,7 +1103,7 @@ async def on_command_error(ctx, error):
 
 
 class StatusView(View):
-    """狀態卡片下方的暫停/恢復按鈕（僅本人可操作）"""
+    """狀態卡片下方的暫停/恢復按鈕（僅管理員或機器人擁有者可操作）"""
     def __init__(self, user_id: int, guild_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
@@ -1122,8 +1122,13 @@ class StatusView(View):
         self.add_item(btn)
 
     async def toggle(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.defer()
+        # 只有管理員或機器人擁有者能按
+        perms = getattr(interaction.user, 'guild_permissions', None)
+        is_admin = bool(perms and perms.manage_guild)
+        if not (is_admin or await _is_owner(interaction.user)):
+            await interaction.response.send_message(
+                "❌ 只有管理員或機器人擁有者能操作", ephemeral=True
+            )
             return
         new_state = not is_enabled(self.guild_id)
         set_enabled(self.guild_id, new_state)

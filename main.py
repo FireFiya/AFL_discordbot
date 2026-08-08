@@ -55,10 +55,44 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-DATA_FILE = 'data/leaves.json'          # 現用：今天與未來
-ARCHIVE_FILE = 'data/leaves_archive.json'  # 封存：過去的歷史紀錄
-CONFIG_FILE = 'data/config.json'        # 設定（例如面板所在頻道）
-RECURRING_FILE = 'data/recurring.json'  # 定期請假規則（每周X）
+# 擁有者 ID（雙保險）：即使 bot 掛在開發者 Team 底下也一定認得你
+_owner_env = os.getenv('OWNER_ID')
+OWNER_ID = int(_owner_env) if _owner_env and _owner_env.isdigit() else None
+
+
+async def _is_owner(user) -> bool:
+    """是否為機器人擁有者（.env 的 OWNER_ID 或 Discord 應用擁有者）"""
+    if OWNER_ID is not None and user.id == OWNER_ID:
+        return True
+    try:
+        return await bot.is_owner(user)
+    except Exception:
+        return False
+
+
+def owner_only():
+    """指令檢查：只有擁有者能用"""
+    async def predicate(ctx):
+        return await _is_owner(ctx.author)
+    return commands.check(predicate)
+
+
+def owner_or_manage_guild():
+    """指令檢查：擁有者，或具『管理伺服器』權限者"""
+    async def predicate(ctx):
+        if await _is_owner(ctx.author):
+            return True
+        return bool(ctx.guild and ctx.author.guild_permissions.manage_guild)
+    return commands.check(predicate)
+
+
+DATA_DIR = 'data'
+GLOBAL_CONFIG_FILE = 'data/config.json'   # 全域設定：授權的伺服器清單
+# 每個伺服器的資料放在 data/<guild_id>/ 底下
+LEAVES_NAME = 'leaves.json'          # 現用：今天與未來
+ARCHIVE_NAME = 'leaves_archive.json'  # 封存：過去的歷史紀錄
+RECURRING_NAME = 'recurring.json'    # 定期請假規則（每周X）
+GUILD_CONFIG_NAME = 'config.json'    # 該伺服器設定（面板頻道、開關）
 
 TW_TZ = timezone(timedelta(hours=8))    # 台灣時區 UTC+8
 
@@ -67,53 +101,114 @@ WEEKDAY_NAMES = ['一', '二', '三', '四', '五', '六', '日']
 # 選單顯示順序：日 → 六
 WEEKDAY_UI_ORDER = [6, 0, 1, 2, 3, 4, 5]
 
-def ensure_data_file():
-    if not os.path.exists('data'):
-        os.makedirs('data')
-    for path in (DATA_FILE, ARCHIVE_FILE, RECURRING_FILE):
-        if not os.path.exists(path):
-            with open(path, 'w', encoding='utf-8') as f:
+def _guild_dir(guild_id):
+    return os.path.join(DATA_DIR, str(guild_id))
+
+def _guild_path(guild_id, name):
+    return os.path.join(_guild_dir(guild_id), name)
+
+def ensure_guild_files(guild_id):
+    """確保某伺服器的資料夾與各檔案存在"""
+    d = _guild_dir(guild_id)
+    os.makedirs(d, exist_ok=True)
+    for name in (LEAVES_NAME, ARCHIVE_NAME, RECURRING_NAME):
+        p = os.path.join(d, name)
+        if not os.path.exists(p):
+            with open(p, 'w', encoding='utf-8') as f:
                 json.dump({}, f, ensure_ascii=False, indent=2)
 
-def _load(path):
-    ensure_data_file()
+def _load(path, default):
+    if not os.path.exists(path):
+        return default
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def _save(path, data):
-    ensure_data_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def load_leaves():
+# ---------- 全域設定（授權清單） ----------
+
+def load_global_config():
+    return _load(GLOBAL_CONFIG_FILE, {})
+
+def save_global_config(cfg):
+    _save(GLOBAL_CONFIG_FILE, cfg)
+
+def get_authorized_guilds():
+    return load_global_config().get('authorized_guilds', [])
+
+def is_authorized(guild_id):
+    return str(guild_id) in get_authorized_guilds()
+
+def authorize_guild(guild_id):
+    cfg = load_global_config()
+    lst = cfg.setdefault('authorized_guilds', [])
+    if str(guild_id) not in lst:
+        lst.append(str(guild_id))
+        save_global_config(cfg)
+        return True
+    return False
+
+def deauthorize_guild(guild_id):
+    cfg = load_global_config()
+    lst = cfg.get('authorized_guilds', [])
+    if str(guild_id) in lst:
+        lst.remove(str(guild_id))
+        save_global_config(cfg)
+        return True
+    return False
+
+# ---------- 每伺服器設定（面板頻道、開關） ----------
+
+def load_guild_config(guild_id):
+    return _load(_guild_path(guild_id, GUILD_CONFIG_NAME), {})
+
+def save_guild_config(guild_id, cfg):
+    _save(_guild_path(guild_id, GUILD_CONFIG_NAME), cfg)
+
+def get_panel_channel_id(guild_id):
+    return load_guild_config(guild_id).get('panel_channel_id')
+
+def set_panel_channel_id(guild_id, channel_id):
+    cfg = load_guild_config(guild_id)
+    cfg['panel_channel_id'] = channel_id
+    save_guild_config(guild_id, cfg)
+
+def is_enabled(guild_id):
+    """該伺服器是否啟用（預設啟用）"""
+    return load_guild_config(guild_id).get('enabled', True)
+
+def set_enabled(guild_id, enabled):
+    cfg = load_guild_config(guild_id)
+    cfg['enabled'] = enabled
+    save_guild_config(guild_id, cfg)
+
+def is_active(guild_id):
+    """已授權且未暫停，才會實際運作"""
+    return is_authorized(guild_id) and is_enabled(guild_id)
+
+# ---------- 請假資料（每伺服器） ----------
+
+def load_leaves(guild_id):
     """現用資料（今天與未來），請假申請與重複檢查都以此為準"""
-    return _load(DATA_FILE)
+    return _load(_guild_path(guild_id, LEAVES_NAME), {})
 
-def save_leaves(data):
-    _save(DATA_FILE, data)
+def save_leaves(guild_id, data):
+    _save(_guild_path(guild_id, LEAVES_NAME), data)
 
-def load_archive():
-    return _load(ARCHIVE_FILE)
+def load_archive(guild_id):
+    return _load(_guild_path(guild_id, ARCHIVE_NAME), {})
 
-def get_all_leaves():
+def get_all_leaves(guild_id):
     """現用 + 封存 合併，供月曆顯示歷史用（兩者日期不重疊）"""
-    merged = load_archive()
-    merged.update(load_leaves())
+    merged = load_archive(guild_id)
+    merged.update(load_leaves(guild_id))
     return merged
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-def save_config(cfg):
-    ensure_data_file()
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-def add_leave(user_id, username, date_str):
-    leaves = load_leaves()
+def add_leave(guild_id, user_id, username, date_str):
+    leaves = load_leaves(guild_id)
     if date_str not in leaves:
         leaves[date_str] = []
     # 防止重複請假
@@ -121,14 +216,14 @@ def add_leave(user_id, username, date_str):
         if entry['user_id'] == user_id:
             return False
     leaves[date_str].append({'user_id': user_id, 'username': username})
-    save_leaves(leaves)
+    save_leaves(guild_id, leaves)
     return True
 
-def remove_leave(user_id, date_str):
+def remove_leave(guild_id, user_id, date_str):
     """取消使用者在某天的請假（只動現用資料、且只能取消今天起的），回傳是否成功"""
     if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
         return False  # 不允許取消過去的請假
-    leaves = load_leaves()
+    leaves = load_leaves(guild_id)
     if date_str not in leaves:
         return False
     new_list = [e for e in leaves[date_str] if e['user_id'] != user_id]
@@ -138,12 +233,12 @@ def remove_leave(user_id, date_str):
         leaves[date_str] = new_list
     else:
         del leaves[date_str]
-    save_leaves(leaves)
+    save_leaves(guild_id, leaves)
     return True
 
-def get_user_leaves(user_id):
+def get_user_leaves(guild_id, user_id):
     """回傳使用者今天起（含今天）的請假日期（已排序）"""
-    leaves = load_leaves()
+    leaves = load_leaves(guild_id)
     today = datetime.now().date()
     return sorted(
         d for d in leaves
@@ -151,34 +246,34 @@ def get_user_leaves(user_id):
         and any(e['user_id'] == user_id for e in leaves[d])
     )
 
-# ---------- 定期請假（每周X） ----------
+# ---------- 定期請假（每周X，每伺服器） ----------
 
-def load_recurring():
-    return _load(RECURRING_FILE)
+def load_recurring(guild_id):
+    return _load(_guild_path(guild_id, RECURRING_NAME), {})
 
-def save_recurring(data):
-    _save(RECURRING_FILE, data)
+def save_recurring(guild_id, data):
+    _save(_guild_path(guild_id, RECURRING_NAME), data)
 
-def get_user_weekdays(user_id):
+def get_user_weekdays(guild_id, user_id):
     """回傳使用者已設定的定期星期幾（Python weekday，已排序）"""
-    entry = load_recurring().get(str(user_id))
+    entry = load_recurring(guild_id).get(str(user_id))
     return sorted(entry['weekdays']) if entry else []
 
-def add_user_weekday(user_id, username, weekday):
+def add_user_weekday(guild_id, user_id, username, weekday):
     """新增一條定期規則，回傳是否新增成功（已存在則 False）"""
-    data = load_recurring()
+    data = load_recurring(guild_id)
     key = str(user_id)
     entry = data.setdefault(key, {'username': username, 'weekdays': []})
     entry['username'] = username  # 名稱可能改過，順便更新
     if weekday in entry['weekdays']:
         return False
     entry['weekdays'].append(weekday)
-    save_recurring(data)
+    save_recurring(guild_id, data)
     return True
 
-def remove_user_weekday(user_id, weekday):
+def remove_user_weekday(guild_id, user_id, weekday):
     """移除一條定期規則，回傳是否移除成功"""
-    data = load_recurring()
+    data = load_recurring(guild_id)
     key = str(user_id)
     entry = data.get(key)
     if not entry or weekday not in entry['weekdays']:
@@ -186,7 +281,7 @@ def remove_user_weekday(user_id, weekday):
     entry['weekdays'].remove(weekday)
     if not entry['weekdays']:
         del data[key]
-    save_recurring(data)
+    save_recurring(guild_id, data)
     return True
 
 def _month_days_of_weekday(year, month, weekday, from_today=True):
@@ -202,48 +297,48 @@ def _month_days_of_weekday(year, month, weekday, from_today=True):
         result.append(d.strftime("%Y-%m-%d"))
     return result
 
-def generate_recurring_leaves(user_id, username, weekday, year, month):
+def generate_recurring_leaves(guild_id, user_id, username, weekday, year, month):
     """把某月（今天起）符合星期幾的日子請起來，回傳實際新增的天數（重複的會被跳過）"""
     count = 0
     for date_str in _month_days_of_weekday(year, month, weekday):
-        if add_leave(user_id, username, date_str):
+        if add_leave(guild_id, user_id, username, date_str):
             count += 1
     return count
 
-def remove_recurring_leaves(user_id, weekday, year, month):
+def remove_recurring_leaves(guild_id, user_id, weekday, year, month):
     """刪除某月（今天起）符合星期幾的請假，回傳實際刪除的天數"""
     count = 0
     for date_str in _month_days_of_weekday(year, month, weekday):
-        if remove_leave(user_id, date_str):
+        if remove_leave(guild_id, user_id, date_str):
             count += 1
     return count
 
-def count_user_recurring_leaves(user_id, weekday, year, month):
+def count_user_recurring_leaves(guild_id, user_id, weekday, year, month):
     """使用者在某月（今天起）該星期幾實際已請的天數"""
-    leaves = load_leaves()
+    leaves = load_leaves(guild_id)
     return sum(
         1 for date_str in _month_days_of_weekday(year, month, weekday)
         if any(e['user_id'] == user_id for e in leaves.get(date_str, []))
     )
 
-def generate_all_recurring_for_month(year, month):
+def generate_all_recurring_for_month(guild_id, year, month):
     """為所有有定期規則的人產生該月的假，回傳（人數, 總天數）"""
-    data = load_recurring()
+    data = load_recurring(guild_id)
     users = 0
     total = 0
     for key, entry in data.items():
         added = 0
         for wd in entry['weekdays']:
-            added += generate_recurring_leaves(int(key), entry['username'], wd, year, month)
+            added += generate_recurring_leaves(guild_id, int(key), entry['username'], wd, year, month)
         if added:
             users += 1
             total += added
     return users, total
 
 
-def archive_past_leaves():
+def archive_past_leaves(guild_id):
     """將已過去的請假（當天不搬，隔天才搬）從現用搬到封存檔，回傳搬移的天數"""
-    leaves = load_leaves()
+    leaves = load_leaves(guild_id)
     today = datetime.now().date()
     past = [
         d for d in leaves
@@ -251,11 +346,11 @@ def archive_past_leaves():
     ]
     if not past:
         return 0
-    archive = load_archive()
+    archive = load_archive(guild_id)
     for d in past:
         archive[d] = leaves.pop(d)
-    save_leaves(leaves)
-    _save(ARCHIVE_FILE, archive)
+    save_leaves(guild_id, leaves)
+    _save(_guild_path(guild_id, ARCHIVE_NAME), archive)
     return len(past)
 
 FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
@@ -284,9 +379,9 @@ if FONT_PATH is None:
 else:
     log.info(f"使用字型：{FONT_PATH}")
 
-def generate_calendar_image(year, month):
+def generate_calendar_image(guild_id, year, month):
     """產生當月月曆圖，每格顯示當天請假人數（不寫名字），回傳 BytesIO"""
-    leaves = get_all_leaves()
+    leaves = get_all_leaves(guild_id)
 
     cell_w, cell_h = 130, 90
     header_h = 70
@@ -350,9 +445,10 @@ def generate_calendar_image(year, month):
 
 class CalendarView(View):
     """日曆選擇檢視 - 年/月/上下半月/日期選擇，另有「定時請假」模式選星期幾"""
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, guild_id: int):
         super().__init__()
         self.user_id = user_id
+        self.guild_id = guild_id
         now = datetime.now()
         self.year = now.year
         self.month = now.month
@@ -529,9 +625,9 @@ class CalendarView(View):
         name = WEEKDAY_NAMES[weekday]
         now = datetime.now()
 
-        is_new = add_user_weekday(interaction.user.id, interaction.user.name, weekday)
+        is_new = add_user_weekday(self.guild_id, interaction.user.id, interaction.user.name, weekday)
         added = generate_recurring_leaves(
-            interaction.user.id, interaction.user.name, weekday, now.year, now.month
+            self.guild_id, interaction.user.id, interaction.user.name, weekday, now.year, now.month
         )
 
         if is_new:
@@ -560,7 +656,7 @@ class CalendarView(View):
         if datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now().date():
             await interaction.response.send_message("❌ 不能申請過去的日期", ephemeral=True)
             return
-        success = add_leave(interaction.user.id, interaction.user.name, date_str)
+        success = add_leave(self.guild_id, interaction.user.id, interaction.user.name, date_str)
         if not success:
             await interaction.response.send_message(
                 f"⚠️ 你已經申請過 {date_str} 的請假了",
@@ -586,8 +682,9 @@ class CalendarView(View):
 
 class LeaveCalendarView(View):
     """請假月曆檢視 - 顯示當月人數圖，可換月並查詢某天誰請假"""
-    def __init__(self, year: int, month: int):
+    def __init__(self, guild_id: int, year: int, month: int):
         super().__init__(timeout=300)
+        self.guild_id = guild_id
         self.year = year
         self.month = month
         self.build_day_select()
@@ -607,7 +704,7 @@ class LeaveCalendarView(View):
             if isinstance(item, Select):
                 self.remove_item(item)
 
-        leaves = get_all_leaves()
+        leaves = get_all_leaves(self.guild_id)
         options = []
         max_day = calendar.monthrange(self.year, self.month)[1]
         for day in range(1, max_day + 1):
@@ -625,7 +722,7 @@ class LeaveCalendarView(View):
             self.add_item(sel)
 
     def make_embed_and_file(self):
-        buf = generate_calendar_image(self.year, self.month)
+        buf = generate_calendar_image(self.guild_id, self.year, self.month)
         file = discord.File(buf, filename="calendar.png")
         embed = discord.Embed(title="📋 請假月曆", color=discord.Color.orange())
         embed.set_image(url="attachment://calendar.png")
@@ -649,7 +746,7 @@ class LeaveCalendarView(View):
 
     async def day_selected(self, interaction: discord.Interaction):
         date_str = interaction.data['values'][0]
-        leaves = get_all_leaves()
+        leaves = get_all_leaves(self.guild_id)
         names = [u['username'] for u in leaves.get(date_str, [])]
         if names:
             desc = "\n".join(f"• {n}" for n in names)
@@ -669,9 +766,10 @@ class LeaveCalendarView(View):
 
 class RecurringCancelConfirmView(View):
     """停止定期請假的確認：一律停止規則，只問本月已請的假要不要一起刪掉"""
-    def __init__(self, user_id: int, weekday: int):
+    def __init__(self, user_id: int, guild_id: int, weekday: int):
         super().__init__(timeout=120)
         self.user_id = user_id
+        self.guild_id = guild_id
         self.weekday = weekday
 
     async def _do_cancel(self, interaction: discord.Interaction, delete_leaves: bool):
@@ -681,13 +779,13 @@ class RecurringCancelConfirmView(View):
         name = WEEKDAY_NAMES[self.weekday]
         now = datetime.now()
 
-        remove_user_weekday(self.user_id, self.weekday)  # 一律停止定期
+        remove_user_weekday(self.guild_id, self.user_id, self.weekday)  # 一律停止定期
 
         if delete_leaves:
-            removed = remove_recurring_leaves(self.user_id, self.weekday, now.year, now.month)
+            removed = remove_recurring_leaves(self.guild_id, self.user_id, self.weekday, now.year, now.month)
             tail = f"本月（{now.month}月）已請的 **{removed}** 天週{name}也一併刪除。"
         else:
-            kept = count_user_recurring_leaves(self.user_id, self.weekday, now.year, now.month)
+            kept = count_user_recurring_leaves(self.guild_id, self.user_id, self.weekday, now.year, now.month)
             tail = f"本月（{now.month}月）已請的 **{kept}** 天週{name}保留不變。"
 
         log.info(
@@ -714,7 +812,7 @@ class RecurringCancelConfirmView(View):
         if interaction.user.id != self.user_id:
             await interaction.response.defer()
             return
-        view = CancelLeaveView(self.user_id)
+        view = CancelLeaveView(self.user_id, self.guild_id)
         await interaction.response.edit_message(
             content="請選擇要取消的請假：", embed=None, view=view
         )
@@ -722,9 +820,10 @@ class RecurringCancelConfirmView(View):
 
 class CancelLeaveView(View):
     """取消請假檢視 - 定期請假（每周X）置頂，其餘為一般日期"""
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, guild_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
+        self.guild_id = guild_id
         self.build_select()
 
     def build_select(self):
@@ -734,7 +833,7 @@ class CancelLeaveView(View):
 
         options = []
         # 定期請假置頂，優先級最高
-        for wd in get_user_weekdays(self.user_id):
+        for wd in get_user_weekdays(self.guild_id, self.user_id):
             options.append(discord.SelectOption(
                 label=f"每周{WEEKDAY_NAMES[wd]}（定期請假）",
                 value=f"recurring:{wd}",
@@ -742,7 +841,7 @@ class CancelLeaveView(View):
                 description="取消本月的每周定期請假"
             ))
         # 其餘名額給一般日期（選單上限 25）
-        for d in get_user_leaves(self.user_id)[:25 - len(options)]:
+        for d in get_user_leaves(self.guild_id, self.user_id)[:25 - len(options)]:
             options.append(discord.SelectOption(label=d, value=f"date:{d}"))
 
         if options:
@@ -758,7 +857,7 @@ class CancelLeaveView(View):
             weekday = int(value.split(":", 1)[1])
             name = WEEKDAY_NAMES[weekday]
             now = datetime.now()
-            pending = count_user_recurring_leaves(self.user_id, weekday, now.year, now.month)
+            pending = count_user_recurring_leaves(self.guild_id, self.user_id, weekday, now.year, now.month)
             embed = discord.Embed(
                 title=f"🔁 停止定期請假：每周{name}",
                 description=(
@@ -772,15 +871,15 @@ class CancelLeaveView(View):
             )
             await interaction.response.edit_message(
                 content=None, embed=embed,
-                view=RecurringCancelConfirmView(self.user_id, weekday)
+                view=RecurringCancelConfirmView(self.user_id, self.guild_id, weekday)
             )
             return
 
         # 一般日期
         date_str = value.split(":", 1)[1]
-        ok = remove_leave(self.user_id, date_str)
+        ok = remove_leave(self.guild_id, self.user_id, date_str)
         self.build_select()
-        remaining = get_user_leaves(self.user_id)
+        remaining = get_user_leaves(self.guild_id, self.user_id)
         if ok:
             log.info(f"取消請假：{interaction.user}（{interaction.user.id}）→ {date_str}")
             content = f"✅ 已取消 {date_str} 的請假"
@@ -792,7 +891,7 @@ class CancelLeaveView(View):
 
         # 取消的是「今天」的請假 → 發出公開提醒
         if ok and datetime.strptime(date_str, "%Y-%m-%d").date() == datetime.now().date():
-            n = len(load_leaves().get(date_str, []))
+            n = len(load_leaves(self.guild_id).get(date_str, []))
             if n > 0:
                 tail = f"還有 {n} 人於今日請假"
                 color = discord.Color.gold()
@@ -807,6 +906,22 @@ class CancelLeaveView(View):
             await interaction.channel.send(embed=embed)
 
 
+async def _panel_guard(interaction: discord.Interaction) -> bool:
+    """面板互動守衛：未授權或已暫停就擋下，回傳 True 代表可繼續"""
+    gid = interaction.guild_id
+    if gid is None or not is_authorized(gid):
+        await interaction.response.send_message(
+            "❌ 這個伺服器尚未取得使用授權，請聯繫機器人擁有者。", ephemeral=True
+        )
+        return False
+    if not is_enabled(gid):
+        await interaction.response.send_message(
+            "⏸️ 機器人在這個伺服器目前為暫停狀態。", ephemeral=True
+        )
+        return False
+    return True
+
+
 class PersistentPanelView(View):
     """持久面板 - 機器人重啟後依然有效"""
     def __init__(self):
@@ -814,7 +929,9 @@ class PersistentPanelView(View):
 
     @discord.ui.button(label="請假申請", style=discord.ButtonStyle.primary, custom_id="panel_leave", emoji="📅")
     async def leave_button(self, interaction: discord.Interaction, _button: Button):
-        calendar_view = CalendarView(interaction.user.id)
+        if not await _panel_guard(interaction):
+            return
+        calendar_view = CalendarView(interaction.user.id, interaction.guild_id)
         embed = discord.Embed(
             title="📅 請假日曆",
             description="請選擇要請假的日期",
@@ -824,82 +941,92 @@ class PersistentPanelView(View):
 
     @discord.ui.button(label="查看請假", style=discord.ButtonStyle.secondary, custom_id="panel_view", emoji="📋")
     async def view_button(self, interaction: discord.Interaction, button: Button):
+        if not await _panel_guard(interaction):
+            return
         now = datetime.now()
-        view = LeaveCalendarView(now.year, now.month)
+        view = LeaveCalendarView(interaction.guild_id, now.year, now.month)
         embed, file = view.make_embed_and_file()
         await interaction.response.send_message(embed=embed, view=view, file=file, ephemeral=True)
 
     @discord.ui.button(label="取消請假", style=discord.ButtonStyle.danger, custom_id="panel_cancel", emoji="✖️")
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
-        dates = get_user_leaves(interaction.user.id)
-        weekdays = get_user_weekdays(interaction.user.id)
+        if not await _panel_guard(interaction):
+            return
+        gid = interaction.guild_id
+        dates = get_user_leaves(gid, interaction.user.id)
+        weekdays = get_user_weekdays(gid, interaction.user.id)
         if not dates and not weekdays:
             await interaction.response.send_message("📭 你目前沒有可取消的請假", ephemeral=True)
             return
-        view = CancelLeaveView(interaction.user.id)
+        view = CancelLeaveView(interaction.user.id, gid)
         await interaction.response.send_message(
             "請選擇要取消的請假：", view=view, ephemeral=True
         )
 
 
+def _active_guild_ids():
+    """已授權且啟用的伺服器 ID 清單（字串）"""
+    return [gid for gid in get_authorized_guilds() if is_enabled(int(gid))]
+
+
+def _get_panel_channel(guild_id):
+    ch_id = get_panel_channel_id(guild_id)
+    return bot.get_channel(ch_id) if ch_id else None
+
+
 @tasks.loop(time=time(hour=0, minute=5, tzinfo=TW_TZ))
 async def daily_archive():
-    """每天（台灣時間）凌晨 00:05 把過去的請假搬到封存檔"""
-    count = archive_past_leaves()
-    if count:
-        log.info(f"已封存 {count} 天過期的請假資料")
-
-
-def _get_panel_channel():
-    ch_id = load_config().get('panel_channel_id')
-    return bot.get_channel(ch_id) if ch_id else None
+    """每天（台灣時間）凌晨 00:05 把過去的請假搬到封存檔（每個授權伺服器）"""
+    for gid in _active_guild_ids():
+        count = archive_past_leaves(int(gid))
+        if count:
+            log.info(f"[{gid}] 已封存 {count} 天過期的請假資料")
 
 
 @tasks.loop(time=time(hour=9, minute=0, tzinfo=TW_TZ))
 async def daily_reminder():
-    """每天（台灣時間）早上 9:00：1 號先產生定期假，再提醒今天誰請假"""
+    """每天（台灣時間）早上 9:00：1 號先產生定期假，再提醒今天誰請假（每個授權伺服器）"""
     now = datetime.now(TW_TZ)
     today = now.strftime("%Y-%m-%d")
 
-    # 每月 1 號：先產生本月定期假（順序很重要，這樣 1 號剛好是定期日時也會被提醒到）
-    if now.day == 1:
-        await _generate_monthly_recurring(now.year, now.month)
+    for gid in _active_guild_ids():
+        guild_id = int(gid)
+        # 每月 1 號：先產生本月定期假（順序很重要，1 號剛好是定期日時也會被提醒到）
+        if now.day == 1:
+            await _generate_monthly_recurring(guild_id, now.year, now.month)
 
-    channel = _get_panel_channel()
-    if channel is None:
-        log.warning("找不到面板頻道，無法發送今日請假提醒（請先執行 !設置面板）")
-        return
+        channel = _get_panel_channel(guild_id)
+        if channel is None:
+            log.warning(f"[{gid}] 找不到面板頻道，無法發送今日請假提醒")
+            continue
 
-    today_list = load_leaves().get(today, [])
-    if today_list:
-        # 有人請假 → 紅色
-        names = '、'.join(u['username'] for u in today_list)
-        embed = discord.Embed(
-            title="📢 今日請假提醒",
-            description=f"今天（{today}）請假的有：\n{names}",
-            color=discord.Color.red()
-        )
-    else:
-        # 無人請假 → 綠色，代表今天有團練
-        embed = discord.Embed(
-            title="📢 今日請假提醒",
-            description=f"今天（{today}）無人請假，有團練 🎶",
-            color=discord.Color.green()
-        )
-    await channel.send(embed=embed)
-    log.info(f"已發送今日請假提醒（{today}，{len(today_list)} 人）")
+        today_list = load_leaves(guild_id).get(today, [])
+        if today_list:
+            names = '、'.join(u['username'] for u in today_list)
+            embed = discord.Embed(
+                title="📢 今日請假提醒",
+                description=f"今天（{today}）請假的有：\n{names}",
+                color=discord.Color.red()
+            )
+        else:
+            embed = discord.Embed(
+                title="📢 今日請假提醒",
+                description=f"今天（{today}）無人請假，有團練 🎶",
+                color=discord.Color.green()
+            )
+        await channel.send(embed=embed)
+        log.info(f"[{gid}] 已發送今日請假提醒（{today}，{len(today_list)} 人）")
 
 
-async def _generate_monthly_recurring(year, month):
-    """為所有人產生該月定期假，並在頻道發一則總結（不 @ 任何人）"""
-    users, total = generate_all_recurring_for_month(year, month)
+async def _generate_monthly_recurring(guild_id, year, month):
+    """為某伺服器所有人產生該月定期假，並在頻道發一則總結（不 @ 任何人）"""
+    users, total = generate_all_recurring_for_month(guild_id, year, month)
     if not total:
         return
-    log.info(f"每月定期請假已產生：{year}-{month:02d}，{users} 人共 {total} 天")
+    log.info(f"[{guild_id}] 每月定期請假已產生：{year}-{month:02d}，{users} 人共 {total} 天")
 
-    channel = _get_panel_channel()
+    channel = _get_panel_channel(guild_id)
     if channel is None:
-        log.warning("找不到面板頻道，無法發送定期請假總結")
         return
     embed = discord.Embed(
         title="📅 本月定期請假已設定完成",
@@ -912,44 +1039,186 @@ async def _generate_monthly_recurring(year, month):
     await channel.send(embed=embed)
 
 
+def migrate_legacy_data():
+    """把舊的全域資料（data/leaves.json 等）搬進面板頻道所屬的伺服器資料夾"""
+    legacy_config = os.path.join(DATA_DIR, 'config.json')
+    legacy_leaves = os.path.join(DATA_DIR, 'leaves.json')
+    # 判斷是否為舊格式：config.json 內含 panel_channel_id（新格式是 authorized_guilds）
+    if not os.path.exists(legacy_leaves):
+        return
+    old_cfg = _load(legacy_config, {})
+    if 'panel_channel_id' not in old_cfg:
+        return  # 已是新格式或無舊設定，不處理
+
+    ch_id = old_cfg.get('panel_channel_id')
+    channel = bot.get_channel(ch_id) if ch_id else None
+    if channel is None or channel.guild is None:
+        log.warning("舊資料遷移：無法從面板頻道判斷所屬伺服器，暫不遷移（資料保留原處）")
+        return
+
+    guild_id = channel.guild.id
+    ensure_guild_files(guild_id)
+    # 搬移三個資料檔
+    for name in (LEAVES_NAME, ARCHIVE_NAME, RECURRING_NAME):
+        src = os.path.join(DATA_DIR, name)
+        if os.path.exists(src):
+            data = _load(src, {})
+            _save(_guild_path(guild_id, name), data)
+            os.remove(src)
+    # 建立該伺服器設定
+    set_panel_channel_id(guild_id, ch_id)
+    set_enabled(guild_id, True)
+    # 把舊全域 config（panel_channel_id）就地覆寫成新格式（authorized_guilds）
+    # 注意：舊 config 與新全域 config 是同一個檔（data/config.json），不能刪除
+    save_global_config({'authorized_guilds': [str(guild_id)]})
+    log.info(f"舊資料已遷移到伺服器 {channel.guild.name}（{guild_id}）並自動授權")
+
+
 @bot.event
 async def on_ready():
     log.info(f'{bot.user} 已連接到 Discord')
-    ensure_data_file()
+    migrate_legacy_data()
     bot.add_view(PersistentPanelView())
     log.info("持久面板已註冊")
     # 啟動時先封存一次，之後每天定時封存
-    archive_past_leaves()
+    for gid in _active_guild_ids():
+        archive_past_leaves(int(gid))
     if not daily_archive.is_running():
         daily_archive.start()
     if not daily_reminder.is_running():
         daily_reminder.start()
-    log.info("每日封存與提醒任務已啟動")
+    log.info(f"已授權伺服器：{get_authorized_guilds()}；每日任務已啟動")
 
 
 @bot.event
 async def on_command_error(ctx, error):
     """統一的指令錯誤處理"""
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ 你需要「管理伺服器」權限才能使用此指令", delete_after=10)
-    elif isinstance(error, commands.CommandNotFound):
+    if isinstance(error, commands.CommandNotFound):
         pass  # 打錯指令名就安靜忽略，不洗 log
+    elif isinstance(error, (commands.CheckFailure, commands.MissingPermissions)):
+        # 權限不足（含自訂的 owner_only / owner_or_manage_guild）
+        await ctx.send("❌ 你沒有權限使用此指令", delete_after=10)
     else:
         log.error(f"指令錯誤（{ctx.command}）：{error}")
+
+
+class StatusView(View):
+    """狀態卡片下方的暫停/恢復按鈕（僅本人可操作）"""
+    def __init__(self, user_id: int, guild_id: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self._refresh_button()
+
+    def _refresh_button(self):
+        self.clear_items()
+        enabled = is_enabled(self.guild_id)
+        btn = Button(
+            label="暫停機器人" if enabled else "恢復機器人",
+            emoji="⏸️" if enabled else "▶️",
+            style=discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success,
+        )
+        btn.callback = self.toggle
+        self.add_item(btn)
+
+    async def toggle(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.defer()
+            return
+        new_state = not is_enabled(self.guild_id)
+        set_enabled(self.guild_id, new_state)
+        log.info(f"[{self.guild_id}] {interaction.user} 將機器人切換為 {'啟用' if new_state else '暫停'}")
+        self._refresh_button()
+        await interaction.response.edit_message(
+            embed=_build_status_embed(interaction.guild), view=self
+        )
+
+
+def _build_status_embed(guild):
+    gid = guild.id
+    enabled = is_enabled(gid)
+    ch_id = get_panel_channel_id(gid)
+    leaves = load_leaves(gid)
+    recurring = load_recurring(gid)
+    leave_days = len(leaves)
+    leave_people = sum(len(v) for v in leaves.values())
+
+    embed = discord.Embed(
+        title="🤖 機器人狀態",
+        color=discord.Color.green() if enabled else discord.Color.light_grey()
+    )
+    embed.add_field(name="伺服器", value=guild.name, inline=False)
+    embed.add_field(name="狀態", value="✅ 運作中" if enabled else "⏸️ 已暫停", inline=True)
+    embed.add_field(
+        name="面板頻道",
+        value=f"<#{ch_id}>" if ch_id else "尚未設定",
+        inline=True
+    )
+    embed.add_field(name="現用請假", value=f"{leave_days} 天 / {leave_people} 人次", inline=True)
+    embed.add_field(name="定期請假", value=f"{len(recurring)} 人", inline=True)
+    embed.set_footer(text="下方按鈕可暫停 / 恢復本伺服器的機器人")
+    return embed
+
+
+@bot.command(name='授權')
+@owner_only()
+async def authorize_cmd(ctx):
+    """授權目前伺服器使用機器人（僅機器人擁有者）"""
+    if ctx.guild is None:
+        await ctx.send("請在伺服器內使用此指令")
+        return
+    added = authorize_guild(ctx.guild.id)
+    ensure_guild_files(ctx.guild.id)
+    if added:
+        log.info(f"擁有者授權伺服器：{ctx.guild.name}（{ctx.guild.id}）")
+        await ctx.send(f"✅ 已授權「{ctx.guild.name}」使用機器人，請用 `!設置面板` 開始設定")
+    else:
+        await ctx.send("ℹ️ 這個伺服器已經授權過了")
+
+
+@bot.command(name='取消授權')
+@owner_only()
+async def deauthorize_cmd(ctx):
+    """取消目前伺服器的使用授權（僅機器人擁有者）"""
+    if ctx.guild is None:
+        return
+    if deauthorize_guild(ctx.guild.id):
+        log.info(f"擁有者取消授權伺服器：{ctx.guild.name}（{ctx.guild.id}）")
+        await ctx.send(f"✅ 已取消「{ctx.guild.name}」的授權，機器人在此伺服器將停止運作")
+    else:
+        await ctx.send("ℹ️ 這個伺服器本來就沒有授權")
+
+
+@bot.command(name='狀態')
+@owner_or_manage_guild()
+async def status_cmd(ctx):
+    """顯示機器人狀態並可暫停/恢復（需管理伺服器權限，僅本人可見）"""
+    if ctx.guild is None:
+        return
+    if not is_authorized(ctx.guild.id):
+        await ctx.send("❌ 這個伺服器尚未取得使用授權，請聯繫機器人擁有者", delete_after=10)
+        return
+    view = StatusView(ctx.author.id, ctx.guild.id)
+    await ctx.send(embed=_build_status_embed(ctx.guild), view=view, ephemeral=True)
 
 
 @bot.command(name='設置面板')
 async def setup_panel(ctx):
     """發送請假面板：管理員可指定頻道；一般人只能在管理員指定的頻道張貼"""
-    is_admin = ctx.guild is not None and ctx.author.guild_permissions.manage_guild
-    cfg = load_config()
-    designated = cfg.get('panel_channel_id')
+    if ctx.guild is None:
+        return
+    guild_id = ctx.guild.id
+    if not is_authorized(guild_id):
+        await ctx.send("❌ 這個伺服器尚未取得使用授權，請聯繫機器人擁有者", delete_after=10)
+        return
+
+    is_admin = await _is_owner(ctx.author) or ctx.author.guild_permissions.manage_guild
+    designated = get_panel_channel_id(guild_id)
 
     if is_admin:
         # 管理員「起個頭 / 更改頻道」：把當前頻道設為指定頻道
-        cfg['panel_channel_id'] = ctx.channel.id
-        save_config(cfg)
-        log.info(f"面板已設置＋指定頻道更新：{ctx.author} 於頻道 {ctx.channel}（{ctx.channel.id}）")
+        set_panel_channel_id(guild_id, ctx.channel.id)
+        log.info(f"[{guild_id}] 面板設置＋指定頻道更新：{ctx.author} 於 {ctx.channel}（{ctx.channel.id}）")
     else:
         # 一般人只能在管理員指定的頻道張貼面板
         if designated is None:
@@ -958,7 +1227,7 @@ async def setup_panel(ctx):
         if ctx.channel.id != designated:
             await ctx.send("❌ 只能在管理員指定的頻道設置面板", delete_after=10)
             return
-        log.info(f"面板已張貼（指定頻道）：{ctx.author} 於頻道 {ctx.channel}（{ctx.channel.id}）")
+        log.info(f"[{guild_id}] 面板已張貼（指定頻道）：{ctx.author} 於 {ctx.channel}")
 
     embed = discord.Embed(
         title="🏢 請假系統",
@@ -970,11 +1239,16 @@ async def setup_panel(ctx):
 
 
 @bot.command(name='清空請假')
-@commands.has_permissions(manage_guild=True)
+@owner_or_manage_guild()
 async def clear_leaves(ctx):
     """清空目前（今天與未來）的請假記錄，歷史封存保留（需管理伺服器權限）"""
-    save_leaves({})
-    log.info(f"清空請假：{ctx.author}（{ctx.author.id}）清空了現用請假記錄")
+    if ctx.guild is None:
+        return
+    if not is_authorized(ctx.guild.id):
+        await ctx.send("❌ 這個伺服器尚未取得使用授權", delete_after=10)
+        return
+    save_leaves(ctx.guild.id, {})
+    log.info(f"[{ctx.guild.id}] 清空請假：{ctx.author}（{ctx.author.id}）")
     await ctx.send("✅ 已清空目前（今天與未來）的請假記錄\n（過去的歷史封存仍保留）")
 
 

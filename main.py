@@ -478,9 +478,11 @@ class CalendarView(View):
             weekday_select.callback = self.weekday_selected
             self.add_item(weekday_select)
         else:
+            # 只開放今年與明年（請假不需要排太遠）
+            base_year = datetime.now().year
             year_options = [
                 discord.SelectOption(label=str(y), value=str(y), default=(y == self.year))
-                for y in range(self.year, self.year + 25)
+                for y in range(base_year, base_year + 2)
             ]
             year_select = discord.ui.Select(
                 placeholder="選擇年份...",

@@ -3,7 +3,8 @@
 .env.local
 
 # 執行資料（含使用者名稱、ID、頻道等，勿提交）
-data/*.json
+# 每伺服器分目錄 data/<guild_id>/，全部忽略
+data/
 
 # 日誌
 logs/

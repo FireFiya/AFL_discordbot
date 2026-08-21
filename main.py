@@ -92,6 +92,7 @@ GLOBAL_CONFIG_FILE = 'data/config.json'   # 全域設定：授權的伺服器清
 LEAVES_NAME = 'leaves.json'          # 現用：今天與未來
 ARCHIVE_NAME = 'leaves_archive.json'  # 封存：過去的歷史紀錄
 RECURRING_NAME = 'recurring.json'    # 定期請假規則（每周X）
+NOTIFY_NAME = 'subscribers.json'     # 訂閱私訊通知的使用者清單
 GUILD_CONFIG_NAME = 'config.json'    # 該伺服器設定（面板頻道、開關）
 
 TW_TZ = timezone(timedelta(hours=8))    # 台灣時區 UTC+8
@@ -334,6 +335,36 @@ def generate_all_recurring_for_month(guild_id, year, month):
             users += 1
             total += added
     return users, total
+
+
+# ---------- 私訊通知訂閱（每伺服器） ----------
+
+def load_subscribers(guild_id):
+    return _load(_guild_path(guild_id, NOTIFY_NAME), [])
+
+def save_subscribers(guild_id, subs):
+    _save(_guild_path(guild_id, NOTIFY_NAME), subs)
+
+def is_subscribed(guild_id, user_id):
+    return user_id in load_subscribers(guild_id)
+
+def add_subscriber(guild_id, user_id):
+    """訂閱通知，回傳是否新增成功（已訂閱則 False）"""
+    subs = load_subscribers(guild_id)
+    if user_id in subs:
+        return False
+    subs.append(user_id)
+    save_subscribers(guild_id, subs)
+    return True
+
+def remove_subscriber(guild_id, user_id):
+    """取消訂閱，回傳是否移除成功"""
+    subs = load_subscribers(guild_id)
+    if user_id not in subs:
+        return False
+    subs.remove(user_id)
+    save_subscribers(guild_id, subs)
+    return True
 
 
 def archive_past_leaves(guild_id):
@@ -674,12 +705,14 @@ class CalendarView(View):
 
         # 當天臨時請假 → 發出公開提醒讓大家注意
         if datetime.strptime(date_str, "%Y-%m-%d").date() == datetime.now().date():
+            desc = f"**{interaction.user.name}** 申請了今天（{date_str}）的請假，請大家注意！"
             embed = discord.Embed(
                 title="⚠️ 有人臨時請假喔",
-                description=f"**{interaction.user.name}** 申請了今天（{date_str}）的請假，請大家注意！",
+                description=desc,
                 color=discord.Color.red()
             )
             await interaction.channel.send(embed=embed)
+            await _dm_subscribers(self.guild_id, "⚠️ 有人臨時請假", desc, discord.Color.red())
 
 
 class LeaveCalendarView(View):
@@ -900,12 +933,14 @@ class CancelLeaveView(View):
             else:
                 tail = "今天無人請假"
                 color = discord.Color.green()
+            desc = f"**{interaction.user.name}** 取消了今天（{date_str}）的請假，{tail}"
             embed = discord.Embed(
                 title="📢 有人取消請假",
-                description=f"**{interaction.user.name}** 取消了今天（{date_str}）的請假，{tail}",
+                description=desc,
                 color=color
             )
             await interaction.channel.send(embed=embed)
+            await _dm_subscribers(self.guild_id, "📢 有人取消請假", desc, color)
 
 
 async def _panel_guard(interaction: discord.Interaction) -> bool:
@@ -976,6 +1011,32 @@ def _get_panel_channel(guild_id):
     return bot.get_channel(ch_id) if ch_id else None
 
 
+async def _dm_subscribers(guild_id, title, desc, color):
+    """把通知私訊給所有訂閱者（標題附上伺服器名，讓對方知道是哪個伺服器）"""
+    subs = load_subscribers(guild_id)
+    if not subs:
+        return
+    guild = bot.get_guild(guild_id)
+    gname = guild.name if guild else str(guild_id)
+    embed = discord.Embed(
+        title=f"{title}｜{gname}",
+        description=desc,
+        color=color
+    )
+    sent = 0
+    for uid in subs:
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            await user.send(embed=embed)
+            sent += 1
+        except discord.Forbidden:
+            log.warning(f"[{guild_id}] 無法私訊訂閱者 {uid}（對方可能關閉私訊）")
+        except Exception as e:
+            log.warning(f"[{guild_id}] 私訊訂閱者 {uid} 失敗：{e}")
+    if sent:
+        log.info(f"[{guild_id}] 已私訊 {sent} 位訂閱者今日請假通知")
+
+
 @tasks.loop(time=time(hour=0, minute=5, tzinfo=TW_TZ))
 async def daily_archive():
     """每天（台灣時間）凌晨 00:05 把過去的請假搬到封存檔（每個授權伺服器）"""
@@ -997,27 +1058,26 @@ async def daily_reminder():
         if now.day == 1:
             await _generate_monthly_recurring(guild_id, now.year, now.month)
 
-        channel = _get_panel_channel(guild_id)
-        if channel is None:
-            log.warning(f"[{gid}] 找不到面板頻道，無法發送今日請假提醒")
-            continue
-
         today_list = load_leaves(guild_id).get(today, [])
         if today_list:
             names = '、'.join(u['username'] for u in today_list)
-            embed = discord.Embed(
-                title="📢 今日請假提醒",
-                description=f"今天（{today}）請假的有：\n{names}",
-                color=discord.Color.red()
-            )
+            desc = f"今天（{today}）請假的有：\n{names}"
+            color = discord.Color.red()
         else:
-            embed = discord.Embed(
-                title="📢 今日請假提醒",
-                description=f"今天（{today}）無人請假，有團練 🎶",
-                color=discord.Color.green()
-            )
-        await channel.send(embed=embed)
-        log.info(f"[{gid}] 已發送今日請假提醒（{today}，{len(today_list)} 人）")
+            desc = f"今天（{today}）無人請假，有團練"
+            color = discord.Color.green()
+
+        # 頻道公告
+        channel = _get_panel_channel(guild_id)
+        if channel is not None:
+            embed = discord.Embed(title="📢 今日請假提醒", description=desc, color=color)
+            await channel.send(embed=embed)
+            log.info(f"[{gid}] 已發送今日請假提醒（{today}，{len(today_list)} 人）")
+        else:
+            log.warning(f"[{gid}] 找不到面板頻道，僅發送私訊通知")
+
+        # 私訊訂閱者（附上伺服器名，讓對方知道是哪個伺服器）
+        await _dm_subscribers(guild_id, "📢 今日請假通知", desc, color)
 
 
 async def _generate_monthly_recurring(guild_id, year, month):
@@ -1207,6 +1267,50 @@ async def status_cmd(ctx):
         return
     view = StatusView(ctx.author.id, ctx.guild.id)
     await ctx.send(embed=_build_status_embed(ctx.guild), view=view, ephemeral=True)
+
+
+@bot.command(name='通知')
+async def notify_cmd(ctx):
+    """開啟/關閉本伺服器的請假私訊通知（任何成員皆可，機器人會私訊確認）"""
+    if ctx.guild is None:
+        await ctx.send("請在伺服器內使用此指令")
+        return
+    guild_id = ctx.guild.id
+    if not is_authorized(guild_id):
+        await ctx.send("❌ 這個伺服器尚未取得使用授權，請聯繫機器人擁有者", delete_after=10)
+        return
+
+    if is_subscribed(guild_id, ctx.author.id):
+        remove_subscriber(guild_id, ctx.author.id)
+        dm_text = f"🔕 已關閉「{ctx.guild.name}」的請假通知，之後不會再私訊你。"
+        opened = False
+    else:
+        add_subscriber(guild_id, ctx.author.id)
+        dm_text = (
+            f"🔔 已開啟「{ctx.guild.name}」的請假通知！\n"
+            "之後每天早上會私訊你今天有誰請假。要關閉再打一次 `!通知` 即可。"
+        )
+        opened = True
+
+    try:
+        await ctx.author.send(dm_text)
+        # 頻道內只給個低調的 ✅，不洩漏內容
+        try:
+            await ctx.message.add_reaction("✅")
+        except discord.HTTPException:
+            pass
+        log.info(f"[{guild_id}] {ctx.author}（{ctx.author.id}）通知訂閱：{'開啟' if opened else '關閉'}")
+    except discord.Forbidden:
+        # 私訊失敗：把剛才的變更還原，避免收不到通知卻以為訂閱了
+        if opened:
+            remove_subscriber(guild_id, ctx.author.id)
+        else:
+            add_subscriber(guild_id, ctx.author.id)
+        await ctx.send(
+            f"⚠️ {ctx.author.mention} 我無法私訊你，請到伺服器設定開啟"
+            "「允許來自伺服器成員的私訊」後再試一次。",
+            delete_after=20
+        )
 
 
 @bot.command(name='設置面板')

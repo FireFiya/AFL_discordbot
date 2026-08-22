@@ -190,6 +190,15 @@ def is_active(guild_id):
     """已授權且未暫停，才會實際運作"""
     return is_authorized(guild_id) and is_enabled(guild_id)
 
+def get_last_recurring_month(guild_id):
+    """上次產生定期假的月份（字串 'YYYY-MM'），用來避免同月重複產生"""
+    return load_guild_config(guild_id).get('last_recurring_month')
+
+def set_last_recurring_month(guild_id, ym):
+    cfg = load_guild_config(guild_id)
+    cfg['last_recurring_month'] = ym
+    save_guild_config(guild_id, cfg)
+
 # ---------- 請假資料（每伺服器） ----------
 
 def load_leaves(guild_id):
@@ -1081,8 +1090,16 @@ async def daily_reminder():
 
 
 async def _generate_monthly_recurring(guild_id, year, month):
-    """為某伺服器所有人產生該月定期假，並在頻道發一則總結（不 @ 任何人）"""
+    """為某伺服器所有人產生該月定期假，並在頻道發一則總結（不 @ 任何人）
+
+    有守衛：同一個月只會產生＋發總結一次，反覆開關暫停也不會重複。
+    """
+    ym = f"{year}-{month:02d}"
+    if get_last_recurring_month(guild_id) == ym:
+        return  # 本月已處理過，直接跳出（避免重複產生與重複發總結）
+
     users, total = generate_all_recurring_for_month(guild_id, year, month)
+    set_last_recurring_month(guild_id, ym)  # 標記本月已處理
     if not total:
         return
     log.info(f"[{guild_id}] 每月定期請假已產生：{year}-{month:02d}，{users} 人共 {total} 天")
@@ -1199,6 +1216,10 @@ class StatusView(View):
         await interaction.response.edit_message(
             embed=_build_status_embed(interaction.guild), view=self
         )
+        # 恢復啟用 → 補產生本月定期假（有守衛，同月不會重複發總結）
+        if new_state:
+            now = datetime.now(TW_TZ)
+            await _generate_monthly_recurring(self.guild_id, now.year, now.month)
 
 
 def _build_status_embed(guild):

@@ -523,10 +523,51 @@ def generate_calendar_image(guild_id, year, month):
     return buf
 
 
-class CalendarView(View):
+class SelfCleaningView(View):
+    """逾時會自己收掉的畫面：時間到就刪掉所在訊息，不留下按了沒反應的按鈕
+
+    - 一般訊息（如 !狀態 卡片）：把訊息存到 self.message，直接刪除
+    - 僅本人可見的訊息：只能用互動 token 刪（15 分鐘內有效），
+      用 bind() 記住發出畫面的互動；之後在畫面上的操作會自動換成較新的 token
+    """
+    def __init__(self, timeout):
+        super().__init__(timeout=timeout)
+        self.message = None
+        self._origin = None  # 原始回應就是畫面所在訊息的互動
+        self._last = None    # 最近一次操作（回應後才知道是更新本訊息、還是另開新訊息）
+
+    def bind(self, interaction: discord.Interaction):
+        """記住發出（或換上）這個畫面的互動"""
+        self._origin = interaction
+
+    def _promote_last(self):
+        itx, self._last = self._last, None
+        if itx is not None and itx.response.type in (
+            discord.InteractionResponseType.message_update,
+            discord.InteractionResponseType.deferred_message_update,
+        ):
+            self._origin = itx  # 回應是更新本訊息 → token 較新，刪除時比較不會過期
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        self._promote_last()
+        self._last = interaction
+        return True
+
+    async def on_timeout(self):
+        self._promote_last()
+        try:
+            if self.message is not None:
+                await self.message.delete()
+            elif self._origin is not None:
+                await self._origin.delete_original_response()
+        except discord.HTTPException:
+            pass  # 已被手動關掉、或 token 已過期，就留著
+
+
+class CalendarView(SelfCleaningView):
     """日曆選擇檢視 - 年/月/上下半月/日期選擇，另有「定時請假」模式選星期幾"""
     def __init__(self, user_id: int, guild_id: int):
-        super().__init__()
+        super().__init__(timeout=180)
         self.user_id = user_id
         self.guild_id = guild_id
         now = datetime.now()
@@ -764,7 +805,7 @@ class CalendarView(View):
             await _dm_subscribers(self.guild_id, "⚠️ 有人臨時請假", desc, discord.Color.red())
 
 
-class LeaveCalendarView(View):
+class LeaveCalendarView(SelfCleaningView):
     """請假月曆檢視 - 顯示當月人數圖，可換月並查詢某天誰請假"""
     def __init__(self, guild_id: int, year: int, month: int):
         super().__init__(timeout=300)
@@ -848,7 +889,7 @@ class LeaveCalendarView(View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-class RecurringCancelConfirmView(View):
+class RecurringCancelConfirmView(SelfCleaningView):
     """停止定期請假的確認：一律停止規則，只問本月已請的假要不要一起刪掉"""
     def __init__(self, user_id: int, guild_id: int, weekday: int):
         super().__init__(timeout=120)
@@ -881,6 +922,7 @@ class RecurringCancelConfirmView(View):
             description=f"下個月起不會再自動排入。\n{tail}",
             color=discord.Color.green()
         )
+        self.stop()  # 結果訊息留著給本人看，不再自動刪除
         await interaction.response.edit_message(content=None, embed=embed, view=None)
 
     @discord.ui.button(label="停止定期 ＋ 刪除當月假", style=discord.ButtonStyle.danger, row=0)
@@ -896,13 +938,16 @@ class RecurringCancelConfirmView(View):
         if interaction.user.id != self.user_id:
             await interaction.response.defer()
             return
+        # 先停掉自己（要在換上新畫面之前），免得逾時把換上的新畫面刪掉
+        self.stop()
         view = CancelLeaveView(self.user_id, self.guild_id)
+        view.bind(interaction)
         await interaction.response.edit_message(
             content="請選擇要取消的請假：", embed=None, view=view
         )
 
 
-class CancelLeaveView(View):
+class CancelLeaveView(SelfCleaningView):
     """取消請假檢視 - 定期請假（每周X）置頂，其餘為一般日期"""
     def __init__(self, user_id: int, guild_id: int):
         super().__init__(timeout=120)
@@ -953,10 +998,10 @@ class CancelLeaveView(View):
                 ),
                 color=discord.Color.orange()
             )
-            await interaction.response.edit_message(
-                content=None, embed=embed,
-                view=RecurringCancelConfirmView(self.user_id, self.guild_id, weekday)
-            )
+            self.stop()  # 換上確認畫面前先停掉自己，免得逾時把確認畫面刪掉
+            confirm = RecurringCancelConfirmView(self.user_id, self.guild_id, weekday)
+            confirm.bind(interaction)
+            await interaction.response.edit_message(content=None, embed=embed, view=confirm)
             return
 
         # 一般日期
@@ -1023,6 +1068,7 @@ class PersistentPanelView(View):
             )
             return
         calendar_view = CalendarView(interaction.user.id, interaction.guild_id)
+        calendar_view.bind(interaction)
         embed = discord.Embed(
             title="📅 請假日曆",
             description="請選擇要請假的日期",
@@ -1036,6 +1082,7 @@ class PersistentPanelView(View):
             return
         now = datetime.now()
         view = LeaveCalendarView(interaction.guild_id, now.year, now.month)
+        view.bind(interaction)
         embed, file = view.make_embed_and_file()
         await interaction.response.send_message(embed=embed, view=view, file=file, ephemeral=True)
 
@@ -1050,6 +1097,7 @@ class PersistentPanelView(View):
             await interaction.response.send_message("📭 你目前沒有可取消的請假", ephemeral=True)
             return
         view = CancelLeaveView(interaction.user.id, gid)
+        view.bind(interaction)
         await interaction.response.send_message(
             "請選擇要取消的請假：", view=view, ephemeral=True
         )
@@ -1226,7 +1274,7 @@ async def on_command_error(ctx, error):
         log.error(f"指令錯誤（{ctx.command}）：{error}")
 
 
-class ManageLeavesView(View):
+class ManageLeavesView(SelfCleaningView):
     """管理請假（管理員 / 機器人擁有者）：選成員 → 勾選要刪的請假 → 刪除並公告"""
     def __init__(self, guild_id: int):
         super().__init__(timeout=300)
@@ -1383,7 +1431,7 @@ def _role_mention(guild, role_id):
     return role.mention if role else f"（已刪除的身分組 {role_id}）"
 
 
-class LeaveRoleView(View):
+class LeaveRoleView(SelfCleaningView):
     """設定可請假的身分組（管理員 / 機器人擁有者）：清單為空時所有人都能請假"""
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=300)
@@ -1450,10 +1498,13 @@ class LeaveRoleView(View):
         await interaction.response.edit_message(embed=self.make_embed(note), view=self)
 
 
-class StatusView(View):
-    """狀態卡片下方的按鈕：暫停/恢復、管理請假、設定身分組（僅管理員或機器人擁有者可操作）"""
+class StatusView(SelfCleaningView):
+    """狀態卡片下方的按鈕：暫停/恢復、管理請假、設定身分組（僅管理員或機器人擁有者可操作）
+
+    卡片是公開訊息、內容會過時，所以 5 分鐘沒人操作就自動刪除，要看再打一次 !狀態
+    """
     def __init__(self, user_id: int, guild_id: int):
-        super().__init__(timeout=120)
+        super().__init__(timeout=300)
         self.user_id = user_id
         self.guild_id = guild_id
         self._refresh_buttons()
@@ -1490,12 +1541,14 @@ class StatusView(View):
         if not await self._check_admin(interaction):
             return
         view = ManageLeavesView(self.guild_id)
+        view.bind(interaction)
         await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
 
     async def open_leave_roles(self, interaction: discord.Interaction):
         if not await self._check_admin(interaction):
             return
         view = LeaveRoleView(interaction.guild)
+        view.bind(interaction)
         await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
 
     async def toggle(self, interaction: discord.Interaction):
@@ -1578,14 +1631,14 @@ async def deauthorize_cmd(ctx):
 @bot.command(name='狀態')
 @owner_or_manage_guild()
 async def status_cmd(ctx):
-    """顯示機器人狀態並可暫停/恢復（需管理伺服器權限，僅本人可見）"""
+    """顯示機器人狀態並可暫停/恢復（需管理伺服器權限；! 指令無法僅本人可見，卡片逾時會自動刪除）"""
     if ctx.guild is None:
         return
     if not is_authorized(ctx.guild.id):
         await ctx.send("❌ 這個伺服器尚未取得使用授權，請聯繫機器人擁有者", delete_after=10)
         return
     view = StatusView(ctx.author.id, ctx.guild.id)
-    await ctx.send(embed=_build_status_embed(ctx.guild), view=view, ephemeral=True)
+    view.message = await ctx.send(embed=_build_status_embed(ctx.guild), view=view)
 
 
 @bot.command(name='通知')

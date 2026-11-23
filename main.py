@@ -86,6 +86,12 @@ def owner_or_manage_guild():
     return commands.check(predicate)
 
 
+async def _is_admin_or_owner(user) -> bool:
+    """按鈕互動用：具『管理伺服器』權限，或是機器人擁有者"""
+    perms = getattr(user, 'guild_permissions', None)
+    return bool(perms and perms.manage_guild) or await _is_owner(user)
+
+
 DATA_DIR = 'data'
 GLOBAL_CONFIG_FILE = 'data/config.json'   # 全域設定：授權的伺服器清單
 # 每個伺服器的資料放在 data/<guild_id>/ 底下
@@ -199,6 +205,22 @@ def set_last_recurring_month(guild_id, ym):
     cfg['last_recurring_month'] = ym
     save_guild_config(guild_id, cfg)
 
+def get_leave_roles(guild_id):
+    """可請假的身分組 ID 清單；空清單代表不限制（所有人都能請假）"""
+    return load_guild_config(guild_id).get('leave_roles', [])
+
+def set_leave_roles(guild_id, role_ids):
+    cfg = load_guild_config(guild_id)
+    cfg['leave_roles'] = role_ids
+    save_guild_config(guild_id, cfg)
+
+def can_request_leave(guild_id, member):
+    """成員是否擁有可請假的身分組（未設定限制時一律可以）"""
+    allowed = get_leave_roles(guild_id)
+    if not allowed:
+        return True
+    return any(r.id in allowed for r in getattr(member, 'roles', []))
+
 # ---------- 請假資料（每伺服器） ----------
 
 def load_leaves(guild_id):
@@ -255,6 +277,24 @@ def get_user_leaves(guild_id, user_id):
         if datetime.strptime(d, "%Y-%m-%d").date() >= today
         and any(e['user_id'] == user_id for e in leaves[d])
     )
+
+def get_leave_holders(guild_id):
+    """今天起有請假、或有定期規則的成員
+
+    回傳 {user_id: {'username', 'days', 'weekdays'}}，依名稱排序
+    """
+    today = datetime.now().date()
+    holders = {}
+    for d, entries in load_leaves(guild_id).items():
+        if datetime.strptime(d, "%Y-%m-%d").date() < today:
+            continue
+        for e in entries:
+            h = holders.setdefault(e['user_id'], {'username': e['username'], 'days': 0, 'weekdays': []})
+            h['days'] += 1
+    for key, entry in load_recurring(guild_id).items():
+        h = holders.setdefault(int(key), {'username': entry['username'], 'days': 0, 'weekdays': []})
+        h['weekdays'] = sorted(entry['weekdays'])
+    return dict(sorted(holders.items(), key=lambda kv: kv[1]['username'].lower()))
 
 # ---------- 定期請假（每周X，每伺服器） ----------
 
@@ -977,6 +1017,11 @@ class PersistentPanelView(View):
     async def leave_button(self, interaction: discord.Interaction, _button: Button):
         if not await _panel_guard(interaction):
             return
+        if not can_request_leave(interaction.guild_id, interaction.user):
+            await interaction.response.send_message(
+                "❌ 你沒有可請假的身分組，如有需要請聯繫管理員。", ephemeral=True
+            )
+            return
         calendar_view = CalendarView(interaction.user.id, interaction.guild_id)
         embed = discord.Embed(
             title="📅 請假日曆",
@@ -1181,15 +1226,239 @@ async def on_command_error(ctx, error):
         log.error(f"指令錯誤（{ctx.command}）：{error}")
 
 
+class ManageLeavesView(View):
+    """管理請假（管理員 / 機器人擁有者）：選成員 → 勾選要刪的請假 → 刪除並公告"""
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.target_id = None
+        self.target_name = None
+        self.selected = []  # 已勾選、待刪除的項目：'date:YYYY-MM-DD' 或 'recurring:<星期幾>'
+        self.build_items()
+
+    def build_items(self):
+        self.clear_items()
+        holders = get_leave_holders(self.guild_id)
+        if self.target_id in holders:
+            self.target_name = holders[self.target_id]['username']
+        else:
+            # 對象已經沒有請假（例如剛刪完），回到選成員
+            self.target_id, self.target_name, self.selected = None, None, []
+        if not holders:
+            return
+
+        member_options = []
+        for uid, info in list(holders.items())[:25]:
+            parts = []
+            if info['days']:
+                parts.append(f"{info['days']} 天請假")
+            if info['weekdays']:
+                parts.append("每周" + "、".join(WEEKDAY_NAMES[wd] for wd in info['weekdays']))
+            member_options.append(discord.SelectOption(
+                label=info['username'], value=str(uid),
+                description="・".join(parts), default=(uid == self.target_id)
+            ))
+        member_select = Select(placeholder="選擇要管理的成員...", options=member_options, row=0)
+        member_select.callback = self.member_selected
+        self.add_item(member_select)
+
+        if self.target_id is None:
+            return
+
+        # 定期請假置頂，其餘名額給一般日期（選單上限 25）
+        item_options = [
+            discord.SelectOption(
+                label=f"每周{WEEKDAY_NAMES[wd]}（定期請假）", value=f"recurring:{wd}", emoji="🔁",
+                description="停止定期，並刪除本月今天起的該星期幾"
+            )
+            for wd in get_user_weekdays(self.guild_id, self.target_id)
+        ]
+        for d in get_user_leaves(self.guild_id, self.target_id)[:25 - len(item_options)]:
+            item_options.append(discord.SelectOption(label=d, value=f"date:{d}"))
+        valid = {o.value for o in item_options}
+        self.selected = [v for v in self.selected if v in valid]
+        for o in item_options:
+            o.default = o.value in self.selected
+
+        item_select = Select(
+            placeholder="勾選要刪除的請假（可複選）...", options=item_options,
+            min_values=1, max_values=len(item_options), row=1
+        )
+        item_select.callback = self.items_selected
+        self.add_item(item_select)
+
+        delete_btn = Button(
+            label="刪除所選", emoji="🗑️", style=discord.ButtonStyle.danger,
+            disabled=not self.selected, row=2
+        )
+        delete_btn.callback = self.delete_selected
+        self.add_item(delete_btn)
+
+    @staticmethod
+    def _describe(value):
+        kind, arg = value.split(":", 1)
+        if kind == "recurring":
+            return f"🔁 每周{WEEKDAY_NAMES[int(arg)]}（停止定期 ＋ 刪除本月該星期幾）"
+        return arg
+
+    def make_embed(self, note=None):
+        if not self.children:
+            desc = "目前（今天起）沒有任何請假紀錄。"
+        elif self.target_id is None:
+            desc = "請從下方選單選擇要管理的成員。"
+        elif not self.selected:
+            desc = f"勾選 **{self.target_name}** 要刪除的請假（可複選），再按「刪除所選」。"
+        else:
+            items = "\n".join(f"• {self._describe(v)}" for v in self.selected)
+            desc = f"即將刪除 **{self.target_name}** 的：\n{items}\n\n刪除後會在面板頻道公告。"
+        if note:
+            desc = f"{note}\n\n{desc}"
+        return discord.Embed(title="🗂️ 管理請假", description=desc, color=discord.Color.orange())
+
+    async def member_selected(self, interaction: discord.Interaction):
+        self.target_id = int(interaction.data['values'][0])
+        self.selected = []
+        self.build_items()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def items_selected(self, interaction: discord.Interaction):
+        self.selected = list(interaction.data['values'])
+        self.build_items()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def delete_selected(self, interaction: discord.Interaction):
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        target_id, target_name = self.target_id, self.target_name
+
+        # 用刪除前後的差集算出實際刪掉的日期（定期與單日可能重疊，避免重複計算）
+        before = set(get_user_leaves(self.guild_id, target_id))
+        stopped = []
+        for value in self.selected:
+            kind, arg = value.split(":", 1)
+            if kind == "recurring":
+                wd = int(arg)
+                if remove_user_weekday(self.guild_id, target_id, wd):
+                    stopped.append(wd)
+                remove_recurring_leaves(self.guild_id, target_id, wd, now.year, now.month)
+            else:
+                remove_leave(self.guild_id, target_id, arg)
+        removed = sorted(before - set(get_user_leaves(self.guild_id, target_id)))
+
+        self.selected = []
+        self.build_items()
+        if not stopped and not removed:
+            await interaction.response.edit_message(
+                embed=self.make_embed("⚠️ 所選的請假已不存在（可能已被取消）"), view=self
+            )
+            return
+
+        lines = [f"🔁 停止每周{WEEKDAY_NAMES[wd]}的定期請假" for wd in stopped]
+        lines += [f"• {d}" for d in removed]
+        detail = "\n".join(lines)
+        log.info(
+            f"[{self.guild_id}] 管理員刪除請假：{interaction.user}（{interaction.user.id}）刪除 "
+            f"{target_name}（{target_id}）的 {removed}，停止定期 {stopped}"
+        )
+        await interaction.response.edit_message(
+            embed=self.make_embed(f"✅ 已刪除 **{target_name}** 的：\n{detail}"), view=self
+        )
+
+        # 公告到面板頻道（找不到就發在目前頻道）
+        desc = f"**{interaction.user.name}** 刪除了 **{target_name}** 的請假：\n{detail}"
+        touched_today = today_str in removed
+        if touched_today:
+            n = len(load_leaves(self.guild_id).get(today_str, []))
+            desc += f"\n\n今天還有 {n} 人請假" if n else "\n\n今天無人請假"
+        color = discord.Color.orange()
+        embed = discord.Embed(title="🗑️ 管理員刪除了請假", description=desc, color=color)
+        channel = _get_panel_channel(self.guild_id) or interaction.channel
+        await channel.send(embed=embed)
+        if touched_today:
+            await _dm_subscribers(self.guild_id, "🗑️ 管理員刪除了今天的請假", desc, color)
+
+
+def _role_mention(guild, role_id):
+    role = guild.get_role(role_id)
+    return role.mention if role else f"（已刪除的身分組 {role_id}）"
+
+
+class LeaveRoleView(View):
+    """設定可請假的身分組（管理員 / 機器人擁有者）：清單為空時所有人都能請假"""
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.build_items()
+
+    def build_items(self):
+        self.clear_items()
+        add_select = discord.ui.RoleSelect(
+            placeholder="新增可請假的身分組（可複選）...", min_values=1, max_values=25, row=0
+        )
+        add_select.callback = self.roles_added
+        self.add_item(add_select)
+
+        role_ids = get_leave_roles(self.guild.id)
+        if role_ids:
+            options = []
+            for rid in role_ids[:25]:
+                role = self.guild.get_role(rid)
+                options.append(discord.SelectOption(
+                    label=role.name if role else f"（已刪除的身分組 {rid}）", value=str(rid)
+                ))
+            remove_select = Select(
+                placeholder="移除身分組（可複選）...", options=options,
+                min_values=1, max_values=len(options), row=1
+            )
+            remove_select.callback = self.roles_removed
+            self.add_item(remove_select)
+
+    def make_embed(self, note=None):
+        role_ids = get_leave_roles(self.guild.id)
+        if role_ids:
+            names = "\n".join(f"• {_role_mention(self.guild, r)}" for r in role_ids)
+            desc = f"只有以下身分組的成員可以使用「請假申請」：\n{names}"
+        else:
+            desc = (
+                "目前**不限制**，所有成員都可以請假。\n"
+                "用下方選單新增身分組後，就只有擁有該身分組的成員能請假。"
+            )
+        if note:
+            desc = f"{note}\n\n{desc}"
+        embed = discord.Embed(title="👥 可請假身分組", description=desc, color=discord.Color.blurple())
+        embed.set_footer(text="查看請假、取消自己的請假不受身分組限制")
+        return embed
+
+    async def roles_added(self, interaction: discord.Interaction):
+        role_ids = get_leave_roles(self.guild.id)
+        added = [int(v) for v in interaction.data['values'] if int(v) not in role_ids]
+        if added:
+            set_leave_roles(self.guild.id, role_ids + added)
+            log.info(f"[{self.guild.id}] {interaction.user} 新增可請假身分組：{added}")
+            note = "✅ 已新增：" + "、".join(_role_mention(self.guild, r) for r in added)
+        else:
+            note = "ℹ️ 所選的身分組都已經在清單中"
+        self.build_items()
+        await interaction.response.edit_message(embed=self.make_embed(note), view=self)
+
+    async def roles_removed(self, interaction: discord.Interaction):
+        removed = [int(v) for v in interaction.data['values']]
+        set_leave_roles(self.guild.id, [r for r in get_leave_roles(self.guild.id) if r not in removed])
+        log.info(f"[{self.guild.id}] {interaction.user} 移除可請假身分組：{removed}")
+        note = "✅ 已移除：" + "、".join(_role_mention(self.guild, r) for r in removed)
+        self.build_items()
+        await interaction.response.edit_message(embed=self.make_embed(note), view=self)
+
+
 class StatusView(View):
-    """狀態卡片下方的暫停/恢復按鈕（僅管理員或機器人擁有者可操作）"""
+    """狀態卡片下方的按鈕：暫停/恢復、管理請假、設定身分組（僅管理員或機器人擁有者可操作）"""
     def __init__(self, user_id: int, guild_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
         self.guild_id = guild_id
-        self._refresh_button()
+        self._refresh_buttons()
 
-    def _refresh_button(self):
+    def _refresh_buttons(self):
         self.clear_items()
         enabled = is_enabled(self.guild_id)
         btn = Button(
@@ -1200,19 +1469,42 @@ class StatusView(View):
         btn.callback = self.toggle
         self.add_item(btn)
 
+        manage = Button(label="管理請假", emoji="🗂️", style=discord.ButtonStyle.primary)
+        manage.callback = self.open_manage_leaves
+        self.add_item(manage)
+
+        roles = Button(label="設定身分組", emoji="👥", style=discord.ButtonStyle.secondary)
+        roles.callback = self.open_leave_roles
+        self.add_item(roles)
+
+    async def _check_admin(self, interaction: discord.Interaction) -> bool:
+        """只有管理員或機器人擁有者能按，回傳 True 代表可繼續"""
+        if await _is_admin_or_owner(interaction.user):
+            return True
+        await interaction.response.send_message(
+            "❌ 只有管理員或機器人擁有者能操作", ephemeral=True
+        )
+        return False
+
+    async def open_manage_leaves(self, interaction: discord.Interaction):
+        if not await self._check_admin(interaction):
+            return
+        view = ManageLeavesView(self.guild_id)
+        await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+
+    async def open_leave_roles(self, interaction: discord.Interaction):
+        if not await self._check_admin(interaction):
+            return
+        view = LeaveRoleView(interaction.guild)
+        await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+
     async def toggle(self, interaction: discord.Interaction):
-        # 只有管理員或機器人擁有者能按
-        perms = getattr(interaction.user, 'guild_permissions', None)
-        is_admin = bool(perms and perms.manage_guild)
-        if not (is_admin or await _is_owner(interaction.user)):
-            await interaction.response.send_message(
-                "❌ 只有管理員或機器人擁有者能操作", ephemeral=True
-            )
+        if not await self._check_admin(interaction):
             return
         new_state = not is_enabled(self.guild_id)
         set_enabled(self.guild_id, new_state)
         log.info(f"[{self.guild_id}] {interaction.user} 將機器人切換為 {'啟用' if new_state else '暫停'}")
-        self._refresh_button()
+        self._refresh_buttons()
         await interaction.response.edit_message(
             embed=_build_status_embed(interaction.guild), view=self
         )
@@ -1244,7 +1536,13 @@ def _build_status_embed(guild):
     )
     embed.add_field(name="現用請假", value=f"{leave_days} 天 / {leave_people} 人次", inline=True)
     embed.add_field(name="定期請假", value=f"{len(recurring)} 人", inline=True)
-    embed.set_footer(text="下方按鈕可暫停 / 恢復本伺服器的機器人")
+    role_ids = get_leave_roles(gid)
+    embed.add_field(
+        name="可請假身分組",
+        value="、".join(_role_mention(guild, r) for r in role_ids) if role_ids else "不限制（所有人）",
+        inline=False
+    )
+    embed.set_footer(text="下方按鈕可暫停 / 恢復機器人、管理請假、設定可請假的身分組")
     return embed
 
 
